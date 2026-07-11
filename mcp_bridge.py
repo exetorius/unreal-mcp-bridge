@@ -44,10 +44,27 @@ carry a Content-Length and are read normally.
 Pure standard library. No pip install, no MCP SDK — it forwards opaque JSON-RPC
 envelopes, so it keeps working when the upstream tool set changes.
 
+Cold-start tool cache
+---------------------
+Claude Code registers an MCP server's tools once, from the initialize/tools-list
+handshake at session start. If the editor is down at that moment, the honest
+answer is "no tools", and the harness freezes that empty set for the whole
+session — a later list_changed is ignored for a server that handshaked empty.
+
+To survive that, the bridge persists the last live `initialize` result and
+`tools/list` to a small JSON file (default: tool_cache.json next to this
+script). When the editor is unreachable at startup it answers initialize and
+tools/list *from that cache immediately*, so Claude registers the real,
+non-empty tool set. It then connects upstream in the background and, if the live
+tool set differs from the cache, emits notifications/tools/list_changed — which
+Claude now honors because the initial registration was non-empty. The only case
+still needing the editor is the very first run ever, when no cache exists yet.
+
 Config (env vars, all optional):
   UNREAL_MCP_URL           upstream endpoint (default http://127.0.0.1:8000/mcp)
   UNREAL_MCP_TOOL_TIMEOUT  socket timeout for tool calls, seconds (default 600)
   UNREAL_MCP_QUICK_TIMEOUT socket timeout for handshake/list, seconds (default 30)
+  UNREAL_MCP_CACHE         tool-cache path (default tool_cache.json beside script)
 """
 
 import json
@@ -68,6 +85,11 @@ _parsed = urlparse(UPSTREAM_URL)
 HOST = _parsed.hostname or "127.0.0.1"
 PORT = _parsed.port or 8000
 PATH = _parsed.path or "/mcp"
+
+CACHE_PATH = os.environ.get(
+    "UNREAL_MCP_CACHE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "tool_cache.json"),
+)
 
 # Backoff schedule (seconds) used while the editor is unreachable. The last
 # value repeats forever, so the bridge keeps trying until UE comes up.
@@ -104,9 +126,52 @@ class State:
         self.epoch = 0
         self.init_request: dict | None = None  # cached downstream `initialize`
         self.protocol_version: str | None = None
+        self.bg_started = False  # a background connect/reconcile is in flight
 
 
 state = State()
+
+_cache_lock = threading.Lock()
+
+
+# --------------------------------------------------------------------------- #
+# Cold-start tool cache (see module docstring)
+# --------------------------------------------------------------------------- #
+
+def load_cache() -> dict | None:
+    """Return the on-disk cache dict, or None if absent/unreadable."""
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_cache(*, protocol_version: str | None = None,
+               initialize_result: dict | None = None,
+               tools_result: dict | None = None) -> None:
+    """Merge the given fields into the cache and write it atomically."""
+    with _cache_lock:
+        data = load_cache() or {}
+        if initialize_result is not None:
+            data["initializeResult"] = initialize_result
+        if tools_result is not None:
+            data["tools"] = tools_result.get("tools", [])
+        if protocol_version:
+            data["protocolVersion"] = protocol_version
+        data["savedAt"] = int(time.time())
+        tmp = CACHE_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, CACHE_PATH)
+        except OSError as err:
+            log(f"could not write tool cache: {err}")
+
+
+def _tools_signature(tools: list) -> str:
+    """A stable fingerprint of a tool set, sensitive to names and schemas."""
+    return json.dumps(sorted(tools, key=lambda t: t.get("name", "")), sort_keys=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -259,13 +324,17 @@ def _http_request_retrying(payload: dict, session_id: str | None, timeout: float
 # Session lifecycle
 # --------------------------------------------------------------------------- #
 
-def _handshake(init_request: dict) -> tuple[str, dict | None]:
+def _handshake(init_request: dict, retry: bool = True) -> tuple[str, dict | None]:
     """Run initialize + notifications/initialized upstream.
 
-    Returns (session_id, initialize_result_message). Retries through connection
-    refusals so the editor can still be launching.
+    Returns (session_id, initialize_result_message). With retry=True (default)
+    it rides out connection refusals so the editor can still be launching; with
+    retry=False it makes a single attempt and lets OSError/ConnectionError
+    propagate — used for the bounded cold-start probe that decides whether to
+    fall back to the cache.
     """
-    resp = _http_request_retrying(init_request, None, QUICK_TIMEOUT)
+    send = _http_request_retrying if retry else _http_request
+    resp = send(init_request, None, QUICK_TIMEOUT)
     try:
         if resp.status >= 400:
             raise RuntimeError(f"upstream initialize failed: HTTP {resp.status}")
@@ -306,21 +375,110 @@ def ensure_session(min_epoch: int) -> tuple[str, int]:
         return state.session_id, state.epoch
 
 
+def ensure_session_quick(min_epoch: int) -> tuple[str, int]:
+    """Like ensure_session, but a single bounded attempt (no infinite retry).
+
+    Raises OSError/ConnectionError if the editor is unreachable, so callers can
+    fall back to the cache instead of blocking.
+    """
+    with state.lock:
+        if state.session_id is not None and state.epoch > min_epoch:
+            return state.session_id, state.epoch
+        if state.init_request is None:
+            raise RuntimeError("cannot (re)initialize before downstream initialize")
+        state.session_id, _ = _handshake(state.init_request, retry=False)
+        state.epoch += 1
+        log(f"established upstream session (epoch {state.epoch})")
+        return state.session_id, state.epoch
+
+
+def _upstream_roundtrip(msg: dict, timeout: float) -> dict | None:
+    """Send one request upstream and return its matching reply message.
+
+    Bounded (no infinite reconnect): recovers once from a stale session, then
+    lets connection failures propagate so the caller can serve the cache. Does
+    not write anything downstream — used for reconciliation and cache-guarded
+    tools/list.
+    """
+    target_id = msg.get("id")
+    failed_epoch = -1
+    for _ in range(2):
+        session_id, epoch = ensure_session_quick(failed_epoch)
+        resp = _http_request(msg, session_id, timeout)
+        if resp.status in (400, 404):
+            resp.close()
+            failed_epoch = epoch
+            continue
+        try:
+            if resp.status >= 400:
+                return next(resp.messages(), None)
+            for message in resp.messages():
+                if message.get("id") == target_id:
+                    return message
+            return None
+        finally:
+            resp.close()
+    return None
+
+
 def handle_initialize(msg: dict) -> None:
-    """Downstream `initialize`: cache it, handshake upstream once, echo result.
+    """Downstream `initialize`: answer live if the editor is up, else from cache.
 
     Processed inline (not on a worker) so the session exists before any
-    follow-up request is dispatched. Does NOT emit list_changed — this is the
-    first connection, not a recovery. The upstream initialize result echoes the
-    same request id we forwarded, so it maps straight back to Claude's call.
+    follow-up request is dispatched. Tries a single bounded upstream handshake;
+    if that fails and we have a cached initialize result, answers from cache
+    immediately and connects in the background so Claude registers the real,
+    non-empty tool set. Only the very first run ever (no cache) blocks for the
+    editor. Does NOT emit list_changed here — the first connection is not a
+    recovery.
     """
     with state.lock:
         state.init_request = msg
-        session_id, result = _handshake(msg)
+
+    # 1) Editor up? Answer live and refresh the cache.
+    try:
+        with state.lock:
+            session_id, result = _handshake(msg, retry=False)
+            state.session_id = session_id
+            state.epoch += 1
+            epoch = state.epoch
+    except (OSError, ConnectionError, RuntimeError) as err:
+        result = None
+        epoch = None
+        live_err = err
+    else:
+        _emit_initialize(msg, result)
+        save_cache(protocol_version=state.protocol_version,
+                   initialize_result=result.get("result") if result else None)
+        log(f"downstream initialized live (epoch {epoch})")
+        return
+
+    # 2) Editor down but we have a cache — answer from it, connect in background.
+    cache = load_cache()
+    if cache and cache.get("initializeResult"):
+        state.protocol_version = cache.get("protocolVersion")
+        write_downstream({"jsonrpc": "2.0", "id": msg.get("id"),
+                          "result": cache["initializeResult"]})
+        log(f"upstream down at startup ({live_err}); answered initialize from "
+            f"cache; connecting in background")
+        _ensure_background_connect()
+        return
+
+    # 3) No cache — the first run ever must reach the editor. Block-retry.
+    log(f"upstream down and no cache ({live_err}); waiting for the editor")
+    with state.lock:
+        session_id, result = _handshake(msg, retry=True)
         state.session_id = session_id
         state.epoch += 1
         epoch = state.epoch
+    _emit_initialize(msg, result)
+    save_cache(protocol_version=state.protocol_version,
+               initialize_result=result.get("result") if result else None)
+    log(f"downstream initialized (epoch {epoch})")
 
+
+def _emit_initialize(msg: dict, result: dict | None) -> None:
+    """Send the initialize reply downstream (or an error if upstream gave none)."""
     if result is not None:
         write_downstream(result)
     else:
@@ -329,7 +487,101 @@ def handle_initialize(msg: dict) -> None:
             "id": msg.get("id"),
             "error": {"code": -32603, "message": "upstream initialize returned no result"},
         })
-    log(f"downstream initialized (epoch {epoch})")
+
+
+def _ensure_background_connect() -> None:
+    """Start the background connect/reconcile once, if not already running."""
+    with state.lock:
+        if state.bg_started or state.session_id is not None:
+            return
+        state.bg_started = True
+    threading.Thread(target=_background_connect, daemon=True).start()
+
+
+def _background_connect() -> None:
+    """Establish the real upstream session, then reconcile the cached tool set.
+
+    Runs after we answered initialize from cache. Retries WITHOUT holding
+    state.lock — a lock-held retry would starve cache-guarded tools/list, which
+    is exactly what has to stay responsive while the editor is still down. The
+    lock is taken only briefly, to publish the session if nobody beat us to it.
+    """
+    attempt = 0
+    while True:
+        try:
+            session_id, _ = _handshake(state.init_request, retry=False)
+        except (OSError, ConnectionError, RuntimeError) as err:
+            delay = BACKOFF[min(attempt, len(BACKOFF) - 1)]
+            if attempt == 0 or attempt % 5 == 0:
+                log(f"background connect waiting for editor ({err}); "
+                    f"retry in {delay}s")
+            time.sleep(delay)
+            attempt += 1
+            continue
+        break
+
+    with state.lock:
+        if state.session_id is None:
+            state.session_id = session_id
+            state.epoch += 1
+        epoch = state.epoch
+    log(f"background upstream session established (epoch {epoch}); reconciling tools")
+    try:
+        reconcile_tools()
+    except Exception:  # noqa: BLE001 - keep the bridge alive
+        log("tool reconcile failed:\n" + traceback.format_exc())
+
+
+def reconcile_tools() -> None:
+    """Fetch the live tool set and, if it differs from the cache, notify Claude."""
+    req = {"jsonrpc": "2.0", "id": "__bridge_reconcile__",
+           "method": "tools/list", "params": {}}
+    try:
+        reply = _upstream_roundtrip(req, QUICK_TIMEOUT)
+    except (OSError, ConnectionError, RuntimeError) as err:
+        log(f"tool reconcile skipped ({err})")
+        return
+    if not reply or "result" not in reply:
+        return
+    live = reply["result"].get("tools", [])
+    cached = (load_cache() or {}).get("tools") or []
+    save_cache(protocol_version=state.protocol_version,
+               tools_result=reply["result"])
+    if _tools_signature(live) != _tools_signature(cached):
+        log(f"tool set changed since last run ({len(cached)} -> {len(live)}); "
+            f"notifying Claude")
+        write_downstream({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+    else:
+        log("tool set unchanged since last run")
+
+
+def handle_tools_list(msg: dict) -> None:
+    """Answer tools/list live if the editor is up, else from the cache.
+
+    The cache path is what makes cold start work: right after an initialize we
+    answered from cache, Claude asks for tools/list while the editor is still
+    down, and this serves the cached set so the registration is non-empty.
+    """
+    try:
+        reply = _upstream_roundtrip(msg, QUICK_TIMEOUT)
+    except (OSError, ConnectionError, RuntimeError):
+        reply = None
+    if reply is not None and "result" in reply:
+        write_downstream(reply)
+        save_cache(protocol_version=state.protocol_version,
+                   tools_result=reply["result"])
+        return
+
+    cache = load_cache()
+    if cache and cache.get("tools") is not None:
+        write_downstream({"jsonrpc": "2.0", "id": msg.get("id"),
+                          "result": {"tools": cache["tools"]}})
+        log("answered tools/list from cache (upstream unreachable)")
+        _ensure_background_connect()
+        return
+
+    # No cache and upstream down — fall back to the blocking path (waits for UE).
+    forward(msg)
 
 
 def forward(msg: dict) -> None:
@@ -397,6 +649,19 @@ def worker(msg: dict) -> None:
             })
 
 
+def _tools_list_worker(msg: dict) -> None:
+    try:
+        handle_tools_list(msg)
+    except Exception:  # noqa: BLE001 - last-resort guard, keep the bridge alive
+        log("tools/list worker error:\n" + traceback.format_exc())
+        if "id" in msg:
+            write_downstream({
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "error": {"code": -32603, "message": "bridge internal error"},
+            })
+
+
 def main() -> None:
     log(f"bridge up; upstream = {UPSTREAM_URL}")
     for line in sys.stdin:
@@ -416,6 +681,10 @@ def main() -> None:
             # Already sent upstream as part of our handshake; swallow the
             # downstream copy so we don't double-drive the session.
             pass
+        elif method == "tools/list":
+            # Cache-guarded so a cold start with the editor down still registers
+            # a non-empty tool set.
+            threading.Thread(target=_tools_list_worker, args=(msg,), daemon=True).start()
         else:
             threading.Thread(target=worker, args=(msg,), daemon=True).start()
 

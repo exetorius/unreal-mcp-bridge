@@ -35,11 +35,41 @@ Claude's behalf:
 - if the editor isn't up yet (connection refused), **holds the request and
   retries with backoff**, so you can start Claude before UE;
 - after a reconnect, emits `notifications/tools/list_changed` downstream, so a
-  recompiled or changed tool set is picked up automatically.
+  recompiled or changed tool set is picked up automatically;
+- **caches the tool set to disk**, so even a cold start with the editor down
+  registers the real, non-empty tools (see below).
 
 It's pure Python standard library — no `pip install`, no MCP SDK. It relays
 opaque JSON-RPC envelopes rather than modelling tools, so it keeps working
 unchanged when the upstream tool set changes (e.g. when BoundHound adds tools).
+
+## Cold-start tool cache
+
+There's one gap the reconnect logic alone can't close. Claude Code registers an
+MCP server's tools **once**, from the `initialize` / `tools/list` handshake at
+session start. If the editor happens to be **down at that moment**, the honest
+answer is "no tools" — and Claude freezes that empty set for the entire session.
+A later `tools/list_changed` is ignored, because the harness won't back-fill
+tools into a server that handshaked empty. So a session started before the editor
+was up stayed toolless until you manually ran `/mcp reconnect`.
+
+To close it, the bridge persists the last live `initialize` result and
+`tools/list` to a small JSON file (`tool_cache.json`, next to the script). Then:
+
+- **Editor up at start** — answers live and refreshes the cache. Business as usual.
+- **Editor down at start, cache present** — answers `initialize` **and**
+  `tools/list` straight from the cache, so the registration is the real,
+  non-empty tool set. It then connects upstream in the background and, **only if
+  the live tool set differs** from the cache, emits `tools/list_changed` to pull
+  in the change. Because the initial registration was non-empty, Claude now
+  honors that notification.
+- **First run ever (no cache)** — falls back to waiting for the editor, exactly
+  as before. You need one successful connection to seed the cache; after that,
+  cold starts are covered.
+
+The cache is per-machine, per-build state and regenerates itself on the next live
+run, so it's `.gitignore`d. Delete it any time — worst case is one more
+editor-must-be-up start.
 
 ## Setup
 
@@ -84,6 +114,7 @@ All optional, via environment variables (set them in the `env` block above):
 | `UNREAL_MCP_URL` | `http://127.0.0.1:8000/mcp` | Upstream MCP endpoint. |
 | `UNREAL_MCP_TOOL_TIMEOUT` | `600` | Socket timeout (s) for `tools/call`. |
 | `UNREAL_MCP_QUICK_TIMEOUT` | `30` | Socket timeout (s) for handshake / list. |
+| `UNREAL_MCP_CACHE` | `tool_cache.json` beside the script | Cold-start tool-cache path. |
 
 ## Diagnostics
 
@@ -95,6 +126,15 @@ Expect lines like:
 [mcp-bridge] downstream initialized (epoch 1)
 [mcp-bridge] upstream session invalid (HTTP 404); reinitializing   <- editor was restarted
 [mcp-bridge] established upstream session (epoch 2)
+```
+
+And on a cold start with the editor down (the tool cache at work):
+
+```
+[mcp-bridge] upstream down at startup (...refused...); answered initialize from cache; connecting in background
+[mcp-bridge] answered tools/list from cache (upstream unreachable)
+[mcp-bridge] background upstream session established (epoch 1); reconciling tools
+[mcp-bridge] tool set unchanged since last run          <- or: tool set changed (N -> M); notifying Claude
 ```
 
 ## Requirements
