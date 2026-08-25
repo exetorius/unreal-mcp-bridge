@@ -92,8 +92,31 @@ CACHE_PATH = os.environ.get(
 )
 
 # Backoff schedule (seconds) used while the editor is unreachable. The last
-# value repeats forever, so the bridge keeps trying until UE comes up.
+# value repeats forever, so the bridge keeps trying until UE comes up — unless
+# the caller supplies a deadline (see GRACE / _http_request_retrying).
 BACKOFF = [0.5, 1, 2, 4, 8, 15]
+
+# How long a forwarded request rides out connection refusals before the bridge
+# gives up and reports the editor as down. Long enough to cover a real editor
+# restart (so in-flight calls still replay transparently), short enough that a
+# call made while UE is simply not running costs seconds instead of blocking
+# until the *client's* tool timeout fires — which is what made a dead editor
+# look like a 30-minute hang with no explanation.
+GRACE = float(os.environ.get("UNREAL_MCP_GRACE", "45"))
+
+# JSON-RPC server-defined error code for "editor is down". Distinct from the
+# -32603 that worker() reports for genuine bridge bugs, so the two stay
+# separable in a log rather than both reading as "the bridge broke".
+UPSTREAM_DOWN_CODE = -32001
+
+
+class UpstreamDown(Exception):
+    """The editor stayed unreachable for the whole grace window.
+
+    Deliberately NOT an OSError/ConnectionError subclass: forward() catches
+    those to trigger a reconnect-and-replay, so an OSError here would be caught
+    by that handler and looped on forever — exactly the hang this replaces.
+    """
 
 _stdout_lock = threading.Lock()
 
@@ -304,8 +327,15 @@ def _http_request(payload: dict, session_id: str | None, timeout: float) -> Resp
     return Response(sock, status, headers, reader)
 
 
-def _http_request_retrying(payload: dict, session_id: str | None, timeout: float) -> Response:
-    """As _http_request, but ride out connection refusals (editor still starting)."""
+def _http_request_retrying(payload: dict, session_id: str | None, timeout: float,
+                           deadline: float | None = None) -> Response:
+    """As _http_request, but ride out connection refusals (editor still starting).
+
+    `deadline` is an absolute time.monotonic() value, not a duration — durations
+    get re-based every time they cross a call boundary, which would hand each
+    hop in the chain a fresh full window. With deadline=None this retries
+    forever, preserving the behaviour every pre-existing caller relies on.
+    """
     attempt = 0
     while True:
         try:
@@ -313,8 +343,15 @@ def _http_request_retrying(payload: dict, session_id: str | None, timeout: float
         except (ConnectionRefusedError, ConnectionResetError, ConnectionError,
                 socket.gaierror) as err:
             delay = BACKOFF[min(attempt, len(BACKOFF) - 1)]
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise UpstreamDown(str(err)) from err
+                # Never sleep past the deadline: the 15s backoff tail would
+                # otherwise overshoot a 45s window by a third of its length.
+                delay = min(delay, remaining)
             if attempt == 0 or attempt % 5 == 0:
-                log(f"upstream unreachable ({err}); retrying in {delay}s "
+                log(f"upstream unreachable ({err}); retrying in {delay:.1f}s "
                     f"— is the editor running at {UPSTREAM_URL}?")
             time.sleep(delay)
             attempt += 1
@@ -324,7 +361,8 @@ def _http_request_retrying(payload: dict, session_id: str | None, timeout: float
 # Session lifecycle
 # --------------------------------------------------------------------------- #
 
-def _handshake(init_request: dict, retry: bool = True) -> tuple[str, dict | None]:
+def _handshake(init_request: dict, retry: bool = True,
+               deadline: float | None = None) -> tuple[str, dict | None]:
     """Run initialize + notifications/initialized upstream.
 
     Returns (session_id, initialize_result_message). With retry=True (default)
@@ -332,8 +370,16 @@ def _handshake(init_request: dict, retry: bool = True) -> tuple[str, dict | None
     retry=False it makes a single attempt and lets OSError/ConnectionError
     propagate — used for the bounded cold-start probe that decides whether to
     fall back to the cache.
+
+    `deadline` bounds the retrying form and applies to BOTH round trips below:
+    bounding only the initialize would just move the unbounded wait onto the
+    ack a few lines later.
     """
-    send = _http_request_retrying if retry else _http_request
+    if retry:
+        def send(payload, sid, tmo):
+            return _http_request_retrying(payload, sid, tmo, deadline)
+    else:
+        send = _http_request
     resp = send(init_request, None, QUICK_TIMEOUT)
     try:
         if resp.status >= 400:
@@ -352,24 +398,25 @@ def _handshake(init_request: dict, retry: bool = True) -> tuple[str, dict | None
     # Drive the session to Initialized status so post-init methods are accepted.
     ack = _http_request_retrying(
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
-        session_id, QUICK_TIMEOUT,
+        session_id, QUICK_TIMEOUT, deadline,
     )
     ack.close()
     return session_id, result
 
 
-def ensure_session(min_epoch: int) -> tuple[str, int]:
+def ensure_session(min_epoch: int, deadline: float | None = None) -> tuple[str, int]:
     """Return a live (session_id, epoch), reinitializing if the epoch is stale.
 
     A worker passes the epoch it just failed on; if nobody has advanced past it
-    yet, this call performs the (single) reinitialize under the lock.
+    yet, this call performs the (single) reinitialize under the lock. Raises
+    UpstreamDown if `deadline` passes with the editor still unreachable.
     """
     with state.lock:
         if state.session_id is not None and state.epoch > min_epoch:
             return state.session_id, state.epoch
         if state.init_request is None:
             raise RuntimeError("cannot (re)initialize before downstream initialize")
-        state.session_id, _ = _handshake(state.init_request)
+        state.session_id, _ = _handshake(state.init_request, deadline=deadline)
         state.epoch += 1
         log(f"established upstream session (epoch {state.epoch})")
         return state.session_id, state.epoch
@@ -581,11 +628,20 @@ def handle_tools_list(msg: dict) -> None:
         return
 
     # No cache and upstream down — fall back to the blocking path (waits for UE).
-    forward(msg)
+    # Deliberately unbounded: erroring here would freeze an empty tool set for
+    # the whole session, which is worse than waiting.
+    forward(msg, bounded=False)
 
 
-def forward(msg: dict) -> None:
-    """Forward a post-init request/notification upstream, recovering sessions."""
+def forward(msg: dict, bounded: bool = True) -> None:
+    """Forward a post-init request/notification upstream, recovering sessions.
+
+    `bounded` (the default) gives up after GRACE seconds of refusals and returns
+    an error, so a call made while UE is down costs seconds. Pass False only for
+    cold-start tools/list with no cache to fall back on: there an error would
+    register an empty tool set for the entire session, so blocking until the
+    editor appears is the lesser evil.
+    """
     is_request = "id" in msg
     target_id = msg.get("id")
     method = msg.get("method", "")
@@ -593,8 +649,31 @@ def forward(msg: dict) -> None:
     failed_epoch = -1
     recovered = False
 
+    # Computed ONCE, outside the loop: an editor that flaps (refuse, accept,
+    # refuse) would otherwise grant itself a fresh grace window every lap and
+    # never hit the deadline at all.
+    deadline = time.monotonic() + GRACE if bounded else None
+
     while True:
-        session_id, epoch = ensure_session(failed_epoch)
+        try:
+            session_id, epoch = ensure_session(failed_epoch, deadline)
+        except UpstreamDown as err:
+            log(f"upstream down for {GRACE:.0f}s ({err}); reporting to client")
+            if is_request:
+                write_downstream({
+                    "jsonrpc": "2.0",
+                    "id": target_id,
+                    "error": {
+                        "code": UPSTREAM_DOWN_CODE,
+                        "message": (
+                            f"Unreal Editor unreachable at {UPSTREAM_URL} — connection "
+                            f"refused for {GRACE:.0f}s. The editor must be running before "
+                            f"this tool can be used. Retrying will not help until it is "
+                            f"started; the bridge reconnects automatically once it is."
+                        ),
+                    },
+                })
+            return
         try:
             resp = _http_request(msg, session_id, timeout)
         except (OSError, ConnectionError) as err:

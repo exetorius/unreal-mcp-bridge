@@ -33,7 +33,9 @@ Claude's behalf:
   full handshake (`initialize` + `notifications/initialized`) and **replays the
   request that failed** — the tool call just succeeds, a moment late;
 - if the editor isn't up yet (connection refused), **holds the request and
-  retries with backoff**, so you can start Claude before UE;
+  retries with backoff** for a grace window (`UNREAL_MCP_GRACE`, default 45s),
+  so you can start Claude before UE — and if the window expires, **answers with
+  a JSON-RPC error naming the cause** instead of blocking (see below);
 - after a reconnect, emits `notifications/tools/list_changed` downstream, so a
   recompiled or changed tool set is picked up automatically;
 - **caches the tool set to disk**, so even a cold start with the editor down
@@ -42,6 +44,33 @@ Claude's behalf:
 It's pure Python standard library — no `pip install`, no MCP SDK. It relays
 opaque JSON-RPC envelopes rather than modelling tools, so it keeps working
 unchanged when the upstream tool set changes (e.g. when BoundHound adds tools).
+
+## Reporting a down editor
+
+Riding out refusals is the bridge's headline feature — restart the editor
+mid-session and the in-flight call replays and succeeds. But when the editor is
+simply *not running*, an unbounded wait is the worst possible answer: the bridge
+never replies, so the caller blocks until its own tool timeout fires (30 minutes
+in Claude Code's default). The bridge knew the answer the whole time and was
+writing it to **stderr** — the MCP server log, which the *AI* driving the session
+cannot read. Silence in-band, diagnosis out-of-band.
+
+So the retry is bounded. After `UNREAL_MCP_GRACE` seconds of refusals a forwarded
+request gets a real JSON-RPC error (`-32001`, distinct from the `-32603` used for
+genuine bridge bugs):
+
+```
+Unreal Editor unreachable at http://127.0.0.1:8000/mcp — connection refused for
+45s. The editor must be running before this tool can be used. Retrying will not
+help until it is started; the bridge reconnects automatically once it is.
+```
+
+The wording is deliberately a statement of fact, not an instruction to go talk to
+a human — an unattended agent should be free to decide what to do about it.
+
+One call site opts out (`forward(..., bounded=False)`): cold-start `tools/list`
+with no cache to fall back on. An error there would register an empty tool set
+for the whole session, which is worse than waiting.
 
 ## Cold-start tool cache
 
@@ -115,6 +144,7 @@ All optional, via environment variables (set them in the `env` block above):
 | `UNREAL_MCP_TOOL_TIMEOUT` | `600` | Socket timeout (s) for `tools/call`. |
 | `UNREAL_MCP_QUICK_TIMEOUT` | `30` | Socket timeout (s) for handshake / list. |
 | `UNREAL_MCP_CACHE` | `tool_cache.json` beside the script | Cold-start tool-cache path. |
+| `UNREAL_MCP_GRACE` | `45` | Seconds a forwarded call rides out refusals before reporting the editor as down. |
 
 ## Diagnostics
 

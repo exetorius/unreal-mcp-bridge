@@ -6,6 +6,10 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Per-machine Claude Code settings. Currently caught by a global ignore on the
+# author's machine — repeated here so a fresh clone ignores it too.
+.claude/settings.local.json
+
 # Cold-start tool cache — per-machine/per-build state, regenerated on first live run
 tool_cache.json
 tool_cache.json.tmp
