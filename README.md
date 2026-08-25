@@ -72,6 +72,29 @@ One call site opts out (`forward(..., bounded=False)`): cold-start `tools/list`
 with no cache to fall back on. An error there would register an empty tool set
 for the whole session, which is worse than waiting.
 
+## Reporting a wedged editor
+
+A *down* editor refuses the connection. A **wedged** one — mid-PIE, running a
+blocking script, sitting on a modal dialog — is worse: it accepts the connection,
+takes the request, and never answers. That used to be a 10-minute block **on an
+infinite loop**, because `TimeoutError` subclasses `OSError`, so the timeout was
+caught by the reconnect-and-replay handler; the editor was listening, so the
+handshake succeeded instantly and the call was replayed into another full
+timeout, forever. Measured against a stalling server: the same `tools/call` was
+delivered **12 times in 60 seconds**.
+
+That also made it a correctness bug, not just a slow one. On a refusal the
+request was never delivered, so replaying is free — but a timeout means the
+editor *did* receive it and may be executing it right now. Replaying re-ran the
+mutation.
+
+So a timeout is now terminal and never replayed, reported as `-32002` (distinct
+from `-32001`, because the remedy differs: down means start it, unresponsive
+means go look at it). And the response budget is split — `UNREAL_MCP_HEADER_TIMEOUT`
+(20s) for the headers, the full `UNREAL_MCP_TOOL_TIMEOUT` (600s) for the body
+once they arrive. A wedged editor never sends headers, so it's caught in 20s; a
+genuinely slow tool sends headers, starts streaming, and keeps its whole budget.
+
 ## Cold-start tool cache
 
 There's one gap the reconnect logic alone can't close. Claude Code registers an
@@ -145,6 +168,7 @@ All optional, via environment variables (set them in the `env` block above):
 | `UNREAL_MCP_QUICK_TIMEOUT` | `30` | Socket timeout (s) for handshake / list. |
 | `UNREAL_MCP_CACHE` | `tool_cache.json` beside the script | Cold-start tool-cache path. |
 | `UNREAL_MCP_GRACE` | `45` | Seconds a forwarded call rides out refusals before reporting the editor as down. |
+| `UNREAL_MCP_HEADER_TIMEOUT` | `20` | Seconds to wait for response *headers* before calling the editor wedged. Capped at the call's own timeout. |
 
 ## Diagnostics
 

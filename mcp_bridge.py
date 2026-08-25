@@ -81,6 +81,13 @@ TOOL_TIMEOUT = float(os.environ.get("UNREAL_MCP_TOOL_TIMEOUT", "600"))
 QUICK_TIMEOUT = float(os.environ.get("UNREAL_MCP_QUICK_TIMEOUT", "30"))
 CONNECT_TIMEOUT = 5.0
 
+# Split budget for a response. A wedged editor accepts the connection and then
+# never writes a byte, so it dies at the *header* phase — no need to wait out
+# the full tool budget for that. Once headers arrive the editor has visibly
+# started responding, and a genuinely slow tool gets its whole allowance for
+# the body. Capped at the caller's timeout so a shorter one still wins.
+HEADER_TIMEOUT = float(os.environ.get("UNREAL_MCP_HEADER_TIMEOUT", "20"))
+
 _parsed = urlparse(UPSTREAM_URL)
 HOST = _parsed.hostname or "127.0.0.1"
 PORT = _parsed.port or 8000
@@ -108,6 +115,10 @@ GRACE = float(os.environ.get("UNREAL_MCP_GRACE", "45"))
 # -32603 that worker() reports for genuine bridge bugs, so the two stay
 # separable in a log rather than both reading as "the bridge broke".
 UPSTREAM_DOWN_CODE = -32001
+
+# "Editor is up but never answered." Distinct from UPSTREAM_DOWN_CODE because
+# the remedy differs: down means start it, unresponsive means go look at it.
+UPSTREAM_UNRESPONSIVE_CODE = -32002
 
 
 class UpstreamDown(Exception):
@@ -305,7 +316,7 @@ def _http_request(payload: dict, session_id: str | None, timeout: float) -> Resp
     request = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body
 
     sock = socket.create_connection((HOST, PORT), timeout=CONNECT_TIMEOUT)
-    sock.settimeout(timeout)
+    sock.settimeout(min(HEADER_TIMEOUT, timeout))
     sock.sendall(request)
 
     reader = _SockReader(sock)
@@ -324,6 +335,9 @@ def _http_request(payload: dict, session_id: str | None, timeout: float) -> Resp
         if ":" in line:
             key, value = line.split(":", 1)
             headers[key.strip().lower()] = value.strip()
+    # Headers are in: the editor is demonstrably alive and responding, so hand
+    # the body the caller's full budget (a long tool may stream for minutes).
+    sock.settimeout(timeout)
     return Response(sock, status, headers, reader)
 
 
@@ -633,6 +647,35 @@ def handle_tools_list(msg: dict) -> None:
     forward(msg, bounded=False)
 
 
+def _report_unresponsive(err: Exception, is_request: bool, target_id, timeout: float,
+                         mid_stream: bool = False) -> None:
+    """Tell the client the editor is up but stalled, and stop — never replay.
+
+    Deliberately terminal. The request reached the editor, so it may have run;
+    replaying could repeat side effects, and retrying into the same stall just
+    burns another full timeout.
+    """
+    where = "part-way through its response" if mid_stream else "no response"
+    log(f"upstream unresponsive after {timeout:.0f}s ({err}); not replaying")
+    if not is_request:
+        return
+    write_downstream({
+        "jsonrpc": "2.0",
+        "id": target_id,
+        "error": {
+            "code": UPSTREAM_UNRESPONSIVE_CODE,
+            "message": (
+                f"Unreal Editor at {UPSTREAM_URL} accepted the request but sent "
+                f"{where} within {timeout:.0f}s. The editor is running but not "
+                f"answering — typically mid-PIE, running a blocking script, or "
+                f"showing a modal dialog. This call was not retried: the editor "
+                f"may have executed it, so re-sending could repeat any side "
+                f"effects it had."
+            ),
+        },
+    })
+
+
 def forward(msg: dict, bounded: bool = True) -> None:
     """Forward a post-init request/notification upstream, recovering sessions.
 
@@ -676,6 +719,17 @@ def forward(msg: dict, bounded: bool = True) -> None:
             return
         try:
             resp = _http_request(msg, session_id, timeout)
+        except TimeoutError as err:
+            # MUST precede the OSError clause below — TimeoutError subclasses
+            # OSError, so the reconnect-and-replay handler would otherwise
+            # swallow it: the editor is listening, the handshake succeeds
+            # instantly, and the call is replayed into another full timeout,
+            # forever. A timeout is also the one failure where replay is
+            # unsafe — the request WAS delivered, so the editor may be running
+            # it right now and re-sending would repeat its side effects.
+            _report_unresponsive(err, is_request, target_id,
+                                 min(HEADER_TIMEOUT, timeout))
+            return
         except (OSError, ConnectionError) as err:
             # Socket refused/reset/closed — editor was (re)started. Reinitialize
             # past this epoch (which rides out refusals) and replay.
@@ -705,6 +759,13 @@ def forward(msg: dict, bounded: bool = True) -> None:
                 write_downstream(message)
                 if is_request and message.get("id") == target_id:
                     break
+        except TimeoutError as err:
+            # Headers arrived, then the editor stalled part-way through the
+            # body. Without this the timeout escapes to worker() and is
+            # reported as -32603 "bridge internal error" — blaming the bridge
+            # for the editor hanging, and hiding the real diagnosis.
+            _report_unresponsive(err, is_request, target_id, timeout, mid_stream=True)
+            return
         finally:
             resp.close()
 
