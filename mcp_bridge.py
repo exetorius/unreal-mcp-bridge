@@ -708,9 +708,15 @@ def forward(msg: dict, bounded: bool = True) -> None:
                     "id": target_id,
                     "error": {
                         "code": UPSTREAM_DOWN_CODE,
+                        # Report the actual failure, don't assert a cause. UpstreamDown
+                        # covers anything that outlasted the grace window — a refused
+                        # connection, a failed handshake, a wrong-port bind — and the
+                        # only diagnostic detail lives in `err`. Hardcoding "connection
+                        # refused" here mislabelled every non-refusal and threw the real
+                        # reason away, leaving stderr as the only place to find it.
                         "message": (
-                            f"Unreal Editor unreachable at {UPSTREAM_URL} — connection "
-                            f"refused for {GRACE:.0f}s. The editor must be running before "
+                            f"Unreal Editor unreachable at {UPSTREAM_URL} after "
+                            f"{GRACE:.0f}s ({err}). The editor must be running before "
                             f"this tool can be used. Retrying will not help until it is "
                             f"started; the bridge reconnects automatically once it is."
                         ),
