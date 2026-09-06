@@ -47,6 +47,13 @@ The same four gates run on your pull request:
 | **Smoke (no editor required)** | the bridge survives an absent editor, exits cleanly when stdin closes, and still answers `initialize` from its cold-start cache |
 | **Lint workflows (actionlint)** | workflow schema and expressions, plus shellcheck over every embedded `run:` script |
 
+Those four report through a fifth job named **`CI`**, which goes green only if
+all of them do. That name is load-bearing: the branch ruleset on `main` requires
+a status check with the exact context `CI`, matched by string. Renaming or
+removing the job does not turn pull requests red — it means the required check
+never reports, so they sit on "Expected — Waiting for status to be reported" and
+cannot be merged. Change the job name and the ruleset together, or not at all.
+
 ## Things that will fail review
 
 - **Python older than 3.10 is not supported.** `mcp_bridge.py` uses PEP 604

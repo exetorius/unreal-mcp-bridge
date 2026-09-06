@@ -102,6 +102,13 @@ jobs:
         run: ./actionlint -color
 
   # Single job to point a branch rule at later: it goes green only if all do.
+  #
+  # NOTE: the name "CI" is load-bearing. The protect-default-branch ruleset
+  # requires a status check with this exact context, matched by string, and
+  # nothing connects the two. Rename or remove this job and the required check
+  # never reports: pull requests do not go red, they sit forever on "Expected —
+  # Waiting for status to be reported" and become unmergeable. If you change the
+  # name, update the ruleset in the same change.
   ci:
     name: CI
     runs-on: ubuntu-latest
