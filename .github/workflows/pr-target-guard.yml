@@ -3,13 +3,17 @@ name: PR target guard
 # GitHub has no native setting that restricts which base branch an outside
 # contributor may open a pull request against — anyone with read access can
 # target any branch, including main. This workflow is that missing rule:
-# outside pull requests belong on `contrib`, where they get reviewed before
-# anything is moved to main.
+# outside pull requests are moved onto `contrib`, where they get reviewed
+# before anything is moved to main. The contributor keeps their pull request,
+# their commits and their thread; only the base branch changes.
 #
 # `pull_request_target` is required because a fork's default token is read-only
-# and could not leave a comment. That makes this workflow privileged, so it
-# NEVER checks out or runs the pull request's code — it only reads metadata and
-# calls the API. Do not add a checkout step here.
+# and could neither retarget nor comment. That makes this workflow privileged,
+# so it NEVER checks out or runs the pull request's code — it only reads
+# metadata and calls the API. Do not add a checkout step here.
+#
+# No retarget loop is possible: the `branches` filter matches on the base ref,
+# so once the base is `contrib` this workflow no longer triggers.
 on:
   pull_request_target:
     types: [opened, reopened, edited]
@@ -19,8 +23,8 @@ permissions:
   pull-requests: write
 
 jobs:
-  guard:
-    name: Check base branch
+  retarget:
+    name: Retarget to contrib
     runs-on: ubuntu-latest
     # People who can already push here are trusted to target main directly.
     if: >-
@@ -28,31 +32,44 @@ jobs:
       github.event.pull_request.author_association != 'MEMBER' &&
       github.event.pull_request.author_association != 'COLLABORATOR'
     steps:
-      - name: Ask the author to retarget at contrib, then close
+      - name: Move the pull request onto contrib
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.pull_request.number }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
-          gh pr comment "$NUMBER" --repo "$REPO" --body "$(cat <<'MSG'
-          Thanks for the contribution, and sorry for the automated bounce.
+          set -uo pipefail
 
-          Pull requests from outside the repo are reviewed on the **`contrib`**
-          branch rather than straight onto `main`, so nothing reaches the branch
-          people are running until it has been looked at.
+          if gh pr edit "$NUMBER" --repo "$REPO" --base contrib; then
+            echo "Retargeted PR #$NUMBER from $AUTHOR onto contrib"
+            gh pr comment "$NUMBER" --repo "$REPO" --body "$(cat <<'MSG'
+          Thanks for the contribution! One automatic change: I've moved the base
+          branch of this pull request from `main` to **`contrib`**.
 
-          Nothing is wrong with your change — only the target branch. To retarget,
-          use **Edit** at the top of this pull request and switch the base from
-          `main` to `contrib`, or open a fresh one:
+          Nothing is wrong with your change — contributions are staged on `contrib`
+          and reviewed there before they reach `main`, which is the branch people
+          run against a live editor. Your commits and this thread are untouched; only
+          the target branch changed, and there is nothing you need to do.
+
+          If the diff above now shows more than you expected, rebase onto `contrib`
+          and force-push your branch:
 
           ```
-          gh pr create --base contrib
+          git fetch upstream && git rebase upstream/contrib && git push --force-with-lease
           ```
-
-          Reopen this pull request once the base is `contrib` and the full CI suite
-          will run on it. Thanks again.
           MSG
           )"
-          gh pr close "$NUMBER" --repo "$REPO"
-          echo "Bounced PR #$NUMBER from $AUTHOR (base main, outside contributor)"
+          else
+            echo "Retarget failed for PR #$NUMBER; asking the author instead"
+            gh pr comment "$NUMBER" --repo "$REPO" --body "$(cat <<'MSG'
+          Thanks for the contribution! This pull request targets `main`, but outside
+          contributions are staged on **`contrib`** and reviewed there first.
+
+          I tried to move the base branch automatically and couldn't, so could you
+          retarget it? Use **Edit** at the top of this pull request and switch the
+          base from `main` to `contrib`. Nothing is wrong with the change itself —
+          the pull request is being left open.
+          MSG
+          )"
+          fi
