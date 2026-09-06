@@ -385,9 +385,11 @@ def _handshake(init_request: dict, retry: bool = True,
     propagate — used for the bounded cold-start probe that decides whether to
     fall back to the cache.
 
-    `deadline` bounds the retrying form and applies to BOTH round trips below:
-    bounding only the initialize would just move the unbounded wait onto the
-    ack a few lines later.
+    `retry` and `deadline` both apply to BOTH round trips below. Bounding only
+    the initialize would move the unbounded wait onto the ack a few lines later
+    — which is exactly what this used to do: the ack called the retrying form
+    unconditionally, so `retry=False` still blocked forever if the editor went
+    away between the two calls, and it did so holding state.lock.
     """
     if retry:
         def send(payload, sid, tmo):
@@ -410,10 +412,10 @@ def _handshake(init_request: dict, retry: bool = True,
             state.protocol_version = pv
 
     # Drive the session to Initialized status so post-init methods are accepted.
-    ack = _http_request_retrying(
-        {"jsonrpc": "2.0", "method": "notifications/initialized"},
-        session_id, QUICK_TIMEOUT, deadline,
-    )
+    # Uses `send`, not _http_request_retrying directly, so a retry=False caller
+    # really does get a single attempt (see the docstring).
+    ack = send({"jsonrpc": "2.0", "method": "notifications/initialized"},
+               session_id, QUICK_TIMEOUT)
     ack.close()
     return session_id, result
 

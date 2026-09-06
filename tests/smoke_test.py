@@ -7,6 +7,7 @@ it the same way locally and in CI with `python tests/smoke_test.py`.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -124,11 +125,73 @@ def test_serves_initialize_from_cache():
         proc.kill()
 
 
+def test_handshake_retry_false_is_a_single_attempt():
+    """Regression for #3: the editor vanishing mid-handshake must not hang.
+
+    `_handshake(retry=False)` promises one attempt. The ack used to call the
+    retrying form unconditionally with no deadline, so if the editor answered
+    `initialize` and then went away, the ack looped forever — while two of the
+    three callers held state.lock, deadlocking the bridge.
+    """
+    print("\n[4] editor answers initialize then vanishes -> handshake raises")
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(5)
+
+    # Module constants are read at import time, so aim it at the fake first.
+    os.environ["UNREAL_MCP_URL"] = f"http://127.0.0.1:{port}/mcp"
+    sys.path.insert(0, ROOT)
+    import mcp_bridge
+
+    def serve_initialize_then_vanish():
+        try:
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            body = json.dumps({"jsonrpc": "2.0", "id": 1,
+                               "result": {"protocolVersion": "2025-11-25"}}).encode()
+            head = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Mcp-Session-Id: sess-1\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode("ascii")
+            conn.sendall(head + body)
+            conn.close()
+        finally:
+            srv.close()  # the ack now has nowhere to go
+
+    threading.Thread(target=serve_initialize_then_vanish, daemon=True).start()
+
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "smoke", "version": "0"}}}
+
+    outcome = []
+
+    def run():
+        try:
+            mcp_bridge._handshake(init, retry=False)
+            outcome.append("returned without completing the ack")
+        except Exception as err:  # noqa: BLE001 - any raise beats blocking
+            outcome.append(f"raised {type(err).__name__}")
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=20)
+
+    got = outcome[0] if outcome else "BLOCKED (still running after 20s)"
+    check("retry=False raises instead of blocking", got.startswith("raised"), got)
+
+
 if __name__ == "__main__":
     print(f"smoke: {BRIDGE}\nsmoke: upstream {DEAD_URL} (intentionally closed)")
     test_survives_absent_editor()
     test_exits_when_stdin_closes()
     test_serves_initialize_from_cache()
+    test_handshake_retry_false_is_a_single_attempt()
     print()
     if failures:
         print(f"FAILED ({len(failures)}): {', '.join(failures)}")
