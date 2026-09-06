@@ -1,5 +1,7 @@
 # unreal-mcp-bridge
 
+[![CI](https://github.com/exetorius/unreal-mcp-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/exetorius/unreal-mcp-bridge/actions/workflows/ci.yml)
+
 A tiny stdio↔HTTP relay that keeps **Claude Code** connected to Unreal Engine's
 built-in **Model Context Protocol** server across editor restarts — so you never
 have to run `/mcp reconnect` again.
@@ -200,3 +202,9 @@ And on a cold start with the editor down (the tool cache at work):
 ## License
 
 MIT.
+
+## Contributing
+
+Pull requests are welcome — please open them against the **`contrib`** branch
+rather than `main`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks CI
+runs and how to reproduce them locally.
