@@ -1,0 +1,58 @@
+name: PR target guard
+
+# GitHub has no native setting that restricts which base branch an outside
+# contributor may open a pull request against — anyone with read access can
+# target any branch, including main. This workflow is that missing rule:
+# outside pull requests belong on `contrib`, where they get reviewed before
+# anything is moved to main.
+#
+# `pull_request_target` is required because a fork's default token is read-only
+# and could not leave a comment. That makes this workflow privileged, so it
+# NEVER checks out or runs the pull request's code — it only reads metadata and
+# calls the API. Do not add a checkout step here.
+on:
+  pull_request_target:
+    types: [opened, reopened, edited]
+    branches: [main]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  guard:
+    name: Check base branch
+    runs-on: ubuntu-latest
+    # People who can already push here are trusted to target main directly.
+    if: >-
+      github.event.pull_request.author_association != 'OWNER' &&
+      github.event.pull_request.author_association != 'MEMBER' &&
+      github.event.pull_request.author_association != 'COLLABORATOR'
+    steps:
+      - name: Ask the author to retarget at contrib, then close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          gh pr comment "$NUMBER" --repo "$REPO" --body "$(cat <<'MSG'
+          Thanks for the contribution, and sorry for the automated bounce.
+
+          Pull requests from outside the repo are reviewed on the **`contrib`**
+          branch rather than straight onto `main`, so nothing reaches the branch
+          people are running until it has been looked at.
+
+          Nothing is wrong with your change — only the target branch. To retarget,
+          use **Edit** at the top of this pull request and switch the base from
+          `main` to `contrib`, or open a fresh one:
+
+          ```
+          gh pr create --base contrib
+          ```
+
+          Reopen this pull request once the base is `contrib` and the full CI suite
+          will run on it. Thanks again.
+          MSG
+          )"
+          gh pr close "$NUMBER" --repo "$REPO"
+          echo "Bounced PR #$NUMBER from $AUTHOR (base main, outside contributor)"
