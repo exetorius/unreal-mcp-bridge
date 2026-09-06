@@ -31,13 +31,21 @@ python -c "import mcp_bridge"
 python tests/smoke_test.py
 ```
 
-The same three gates run on your pull request:
+If you touch anything under `.github/workflows/`, lint it too:
+
+```bash
+# actionlint also runs shellcheck over every `run:` block
+actionlint
+```
+
+The same four gates run on your pull request:
 
 | Check | What it protects |
 |---|---|
 | **Lint (ruff)** | undefined names, likely bugs, style — configured in `pyproject.toml` |
 | **Compile & import (3.10–3.13)** | the file parses and imports with no side effects on every supported Python |
 | **Smoke (no editor required)** | the bridge survives an absent editor, exits cleanly when stdin closes, and still answers `initialize` from its cold-start cache |
+| **Lint workflows (actionlint)** | workflow schema and expressions, plus shellcheck over every embedded `run:` script |
 
 ## Things that will fail review
 
