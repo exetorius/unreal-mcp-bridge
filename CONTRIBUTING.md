@@ -5,19 +5,25 @@ Thanks for taking a look at the bridge. It is a single-file stdio↔HTTP relay
 
 ## Where pull requests go
 
-**Open pull requests against `contrib`, not `main`.**
+**Branch from `main`. Open the pull request against `contrib`.**
 
-`main` is what people actually run against a live Unreal Editor, so changes are
-staged on `contrib` and reviewed before they are moved across.
+`main` is what people actually run against a live Unreal Editor, so it is the
+state you want to build on. Changes are then staged on `contrib` and reviewed
+before they are moved across. `contrib` is fast-forwarded to `main` after each
+merge, so the two agree at rest and your pull request shows only your own
+commits.
+
+```bash
+git switch main && git pull
+git switch -c my-change
+# ...
+gh pr create --base contrib
+```
 
 If you forget, nothing breaks: a pull request opened against `main` from outside
 the repo is **retargeted onto `contrib` automatically** and a comment is left
 saying so. Your commits and the discussion are untouched — only the base branch
 changes, and there is nothing you need to do.
-
-```bash
-gh pr create --base contrib
-```
 
 ## Before you open it
 
