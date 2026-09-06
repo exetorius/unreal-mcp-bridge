@@ -55,6 +55,22 @@ def await_line(sink, timeout):
     return sink[0] if sink else None
 
 
+def write_cache(path):
+    """Write a minimal but valid cold-start cache to `path`."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "protocolVersion": "2025-11-25",
+            "initializeResult": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {"listChanged": True}},
+                "serverInfo": {"name": "smoke", "title": "", "version": "0"},
+            },
+            "tools": [{"name": "smoke_tool", "description": "x",
+                       "inputSchema": {"type": "object"}}],
+            "savedAt": int(time.time()),
+        }, f)
+
+
 def test_survives_absent_editor():
     """Cold start with no cache and no editor must not crash the bridge."""
     print("\n[1] cold start, no cache, editor down")
@@ -87,18 +103,7 @@ def test_serves_initialize_from_cache():
     """The headline feature: answer a cold client while the editor is down."""
     print("\n[3] seeded cache, editor down -> initialize is answered")
     tmp = os.path.join(tempfile.mkdtemp(), "seeded.json")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({
-            "protocolVersion": "2025-11-25",
-            "initializeResult": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "smoke", "title": "", "version": "0"},
-            },
-            "tools": [{"name": "smoke_tool", "description": "x",
-                       "inputSchema": {"type": "object"}}],
-            "savedAt": int(time.time()),
-        }, f)
+    write_cache(tmp)
 
     proc = spawn(tmp)
     out = []
@@ -133,7 +138,7 @@ def test_handshake_retry_false_is_a_single_attempt():
     `initialize` and then went away, the ack looped forever — while two of the
     three callers held state.lock, deadlocking the bridge.
     """
-    print("\n[4] editor answers initialize then vanishes -> handshake raises")
+    print("\n[5] editor answers initialize then vanishes -> handshake raises")
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -186,11 +191,55 @@ def test_handshake_retry_false_is_a_single_attempt():
     check("retry=False raises instead of blocking", got.startswith("raised"), got)
 
 
+def test_survives_non_object_json_lines():
+    """Regression for #4: one odd stdin line must not kill the bridge.
+
+    Valid JSON that isn't an object — a batch array, a number, a string, null —
+    used to reach msg.get() and raise AttributeError out of the main loop, so
+    the process exited. Surviving isn't enough on its own, so this also proves
+    the bridge still answers a real request afterwards.
+    """
+    print("\n[4] non-object JSON lines are dropped, not fatal")
+    tmp = os.path.join(tempfile.mkdtemp(), "seeded.json")
+    write_cache(tmp)
+
+    proc = spawn(tmp)
+    out = []
+    reader(proc, out)
+    try:
+        for junk in ('[{"jsonrpc":"2.0","id":9,"method":"tools/list"}]',  # legal batch
+                     "5", '"hello"', "null", "[]"):
+            proc.stdin.write(junk + "\n")
+            proc.stdin.flush()
+        time.sleep(2)
+        check("bridge still running after 5 non-object lines", proc.poll() is None,
+              f"exited with {proc.returncode}")
+        if proc.poll() is not None:
+            return
+
+        # Still functional, not merely alive.
+        proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "smoke", "version": "0"}},
+        }) + "\n")
+        proc.stdin.flush()
+
+        line = await_line(out, timeout=20)
+        check("still answers initialize afterwards", line is not None)
+        if line:
+            msg = json.loads(line)
+            check("and answers the right request", msg.get("id") == 1, repr(msg)[:200])
+    finally:
+        proc.kill()
+
+
 if __name__ == "__main__":
     print(f"smoke: {BRIDGE}\nsmoke: upstream {DEAD_URL} (intentionally closed)")
     test_survives_absent_editor()
     test_exits_when_stdin_closes()
     test_serves_initialize_from_cache()
+    test_survives_non_object_json_lines()
     test_handshake_retry_false_is_a_single_attempt()
     print()
     if failures:
