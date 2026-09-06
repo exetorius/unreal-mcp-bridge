@@ -89,11 +89,16 @@ jobs:
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${file}"
           echo "${ACTIONLINT_SHA256}  ${file}" | sha256sum --check --strict
           tar -xzf "$file" actionlint
+      - name: Assert shellcheck is available
+        # actionlint exits 0 when shellcheck is missing — it just silently skips
+        # the `run:` block checks, which are the ones with no other gate here.
+        # A green result would then prove nothing, so fail loudly instead.
+        run: shellcheck --version
       - name: actionlint
         # Checks workflow schema, expression syntax and action references, and
-        # runs shellcheck over every `run:` block — the part with no other gate,
-        # since both workflows embed bash with nested heredocs. shellcheck is
-        # preinstalled on ubuntu runners and actionlint picks it up from PATH.
+        # runs shellcheck over every `run:` block, since both workflows embed
+        # bash with nested heredocs. shellcheck is preinstalled on ubuntu
+        # runners and actionlint picks it up from PATH.
         run: ./actionlint -color
 
   # Single job to point a branch rule at later: it goes green only if all do.
