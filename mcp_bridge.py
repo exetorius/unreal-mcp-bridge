@@ -175,7 +175,7 @@ _cache_lock = threading.Lock()
 def load_cache() -> dict | None:
     """Return the on-disk cache dict, or None if absent/unreadable."""
     try:
-        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+        with open(CACHE_PATH, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return None

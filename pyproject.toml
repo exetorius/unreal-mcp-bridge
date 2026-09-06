@@ -1,0 +1,20 @@
+# Lint configuration for unreal-mcp-bridge.
+#
+# The same settings CI enforces, so `ruff check .` locally gives the identical
+# answer the pull-request check will. Line length matches how mcp_bridge.py is
+# already written (longest line: 94) rather than ruff's 88-col default, so the
+# gate reports real problems instead of reflowing existing prose.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"  # PEP 604 `X | None` annotations are evaluated at def time
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes — undefined names, unused imports (catches a NameError before it ships)
+    "B",   # flake8-bugbear — likely bugs
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
