@@ -822,22 +822,44 @@ def main() -> None:
             log(f"dropping non-JSON line: {line[:120]!r}")
             continue
 
-        method = msg.get("method")
-        if method == "initialize":
-            handle_initialize(msg)
-        elif method == "notifications/initialized":
-            # Already sent upstream as part of our handshake; swallow the
-            # downstream copy so we don't double-drive the session.
-            pass
-        elif method == "tools/list":
-            # Cache-guarded so a cold start with the editor down still registers
-            # a non-empty tool set.
-            threading.Thread(target=_tools_list_worker, args=(msg,), daemon=True).start()
-        else:
-            threading.Thread(target=worker, args=(msg,), daemon=True).start()
+        # Valid JSON is not necessarily a JSON-RPC object. A bare array (which
+        # is how the spec frames a *batch*), number, string or null would reach
+        # msg.get() and raise AttributeError — uncaught, out of this loop, and
+        # the bridge exits. One odd line must never kill the process Claude
+        # Code depends on, so drop it the same way a non-JSON line is dropped.
+        if not isinstance(msg, dict):
+            kind = "batch" if isinstance(msg, list) else type(msg).__name__
+            log(f"dropping unsupported JSON-RPC line ({kind}): {line[:120]!r}")
+            continue
+
+        # Belt and braces: dispatch itself must not be able to end the loop.
+        # handle_initialize runs inline and does real network work, so a raise
+        # in there used to take the whole bridge with it. worker() and
+        # _tools_list_worker already guard their own threads this way.
+        try:
+            method = msg.get("method")
+            if method == "initialize":
+                handle_initialize(msg)
+            elif method == "notifications/initialized":
+                # Already sent upstream as part of our handshake; swallow the
+                # downstream copy so we don't double-drive the session.
+                pass
+            elif method == "tools/list":
+                # Cache-guarded so a cold start with the editor down still
+                # registers a non-empty tool set.
+                threading.Thread(target=_tools_list_worker, args=(msg,), daemon=True).start()
+            else:
+                threading.Thread(target=worker, args=(msg,), daemon=True).start()
+        except Exception:  # noqa: BLE001 - the loop must outlive any one message
+            log("dispatch error:\n" + traceback.format_exc())
+            if "id" in msg:
+                write_downstream({
+                    "jsonrpc": "2.0",
+                    "id": msg["id"],
+                    "error": {"code": -32603, "message": "bridge internal error"},
+                })
 
     log("stdin closed; bridge exiting")
-
 
 if __name__ == "__main__":
     main()
