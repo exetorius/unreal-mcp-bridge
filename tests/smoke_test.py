@@ -234,6 +234,171 @@ def test_survives_non_object_json_lines():
         proc.kill()
 
 
+def test_tool_call_hints():
+    """New: call_tool errors get annotated from names the bridge has observed.
+
+    Pure unit test against the observation helpers directly — no editor and no
+    subprocess needed, since these functions only ever look at JSON-RPC
+    messages already parsed into dicts. Module-level caches are reset first so
+    this doesn't depend on (or pollute) test order.
+    """
+    print("\n[6] call_tool errors are annotated with previously-seen names")
+    sys.path.insert(0, ROOT)
+    import mcp_bridge
+
+    mcp_bridge._known_toolsets.clear()
+    mcp_bridge._toolset_tools.clear()
+    real_load_cache = mcp_bridge.load_cache
+    mcp_bridge.load_cache = lambda: {"tools": [{"name": "execute_python_code"},
+                                               {"name": "call_tool"}]}
+
+    # Nothing observed yet -> no hint, original error untouched.
+    untouched = {"jsonrpc": "2.0", "id": 1,
+                 "result": {"isError": True, "content": [{"type": "text",
+                            "text": "Unknown tool get_selected_actors"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool", {"toolset_name": "Bogus.Toolset", "tool_name": "x"}, untouched)
+    check("no hint before anything has been observed",
+          out["result"]["content"][0]["text"] == "Unknown tool get_selected_actors")
+
+    # Observe a list_toolsets reply, in the exact "- name: desc" shape the
+    # editor sends — including a multi-line description with its OWN "- "
+    # sub-bullets (regression: this used to be mistaken for two more
+    # toolsets, e.g. "Enum value lookups").
+    lt_reply = {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text":
+                "- editor_toolset.toolsets.scene.SceneTools: scene stuff\n"
+                "- EditorToolset.EditorAppToolset: editor stuff\n"
+                "- NiagaraToolsets.NiagaraToolset_Info: general info.\n\n"
+                "Provides:\n"
+                "- Enum value lookups\n"
+                "- General usage information\n"}]}}
+    mcp_bridge._observe_tool_call_reply("list_toolsets", {}, lt_reply)
+    check("list_toolsets names are learned",
+          mcp_bridge._known_toolsets == {"editor_toolset.toolsets.scene.SceneTools",
+                                          "EditorToolset.EditorAppToolset",
+                                          "NiagaraToolsets.NiagaraToolset_Info"},
+          sorted(mcp_bridge._known_toolsets))
+    check("prose sub-bullets inside a description are not mistaken for toolsets",
+          "Enum value lookups" not in mcp_bridge._known_toolsets and
+          "General usage information" not in mcp_bridge._known_toolsets)
+
+    # No toolset_name at all (the single most common real failure) also gets
+    # a hint, once at least one toolset is known.
+    no_toolset = {"jsonrpc": "2.0", "id": 7,
+                  "result": {"isError": True, "content": [{"type": "text",
+                             "text": "Unknown tool ListActorsInWorld"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool", {"tool_name": "ListActorsInWorld"}, no_toolset)
+    hinted = out["result"]["content"][0]["text"]
+    check("missing toolset_name gets a hint naming the known toolsets",
+          "[bridge hint]" in hinted and "SceneTools" in hinted, hinted)
+
+    # A real top-level tool called with no toolset_name is a correct call that
+    # failed on its own terms — no hint that would send the model guessing.
+    top_level_fail = {"jsonrpc": "2.0", "id": 8,
+                      "result": {"isError": True, "content": [{"type": "text",
+                                 "text": "Traceback: NameError: foo"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool", {"tool_name": "execute_python_code"}, top_level_fail)
+    check("a failing top-level tool is not told it does not exist",
+          out["result"]["content"][0]["text"] == "Traceback: NameError: foo",
+          out["result"]["content"][0]["text"])
+
+    # An unknown toolset now gets a hint listing the known ones.
+    bad_toolset = {"jsonrpc": "2.0", "id": 3,
+                   "result": {"isError": True, "content": [{"type": "text",
+                              "text": "Unknown tool get_selected_actors"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool", {"toolset_name": "EditorToolset.EditorAppToolset.Wrong", "tool_name": "x"},
+        bad_toolset)
+    hinted = out["result"]["content"][0]["text"]
+    check("unknown toolset gets a hint naming the known ones",
+          "[bridge hint]" in hinted and "SceneTools" in hinted, hinted)
+
+    # Observe a describe_toolset reply for one real toolset.
+    dt_reply = {"jsonrpc": "2.0", "id": 4, "result": {"content": [{"type": "text", "text":
+                '{"name":"editor_toolset.toolsets.scene.SceneTools","tools":['
+                '{"name":"editor_toolset.toolsets.scene.SceneTools.save_actor"},'
+                '{"name":"editor_toolset.toolsets.scene.SceneTools.get_actors"}]}'}]}}
+    mcp_bridge._observe_tool_call_reply("describe_toolset", {}, dt_reply)
+    check("describe_toolset tool names are learned",
+          mcp_bridge._toolset_tools.get("editor_toolset.toolsets.scene.SceneTools") ==
+          {"editor_toolset.toolsets.scene.SceneTools.save_actor",
+           "editor_toolset.toolsets.scene.SceneTools.get_actors"})
+
+    # A bad tool name inside a KNOWN toolset now gets the real tool names.
+    bad_tool = {"jsonrpc": "2.0", "id": 5,
+                "result": {"isError": True, "content": [{"type": "text",
+                           "text": "Unknown tool get_selected_actors"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool",
+        {"toolset_name": "editor_toolset.toolsets.scene.SceneTools",
+         "tool_name": "get_selected_actors"},
+        bad_tool)
+    hinted = out["result"]["content"][0]["text"]
+    check("known toolset, bad tool gets a hint naming the real tool names",
+          "[bridge hint]" in hinted and "get_actors" in hinted, hinted)
+
+    # The right tool (bare name, as call_tool takes it, against the qualified
+    # names describe_toolset reported) failing at runtime gets no hint.
+    right_tool_fail = {"jsonrpc": "2.0", "id": 9,
+                       "result": {"isError": True, "content": [{"type": "text",
+                                  "text": "Actor not found"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool",
+        {"toolset_name": "editor_toolset.toolsets.scene.SceneTools",
+         "tool_name": "get_actors"},
+        right_tool_fail)
+    check("a known tool failing at runtime is left untouched",
+          out["result"]["content"][0]["text"] == "Actor not found",
+          out["result"]["content"][0]["text"])
+
+    # A successful call_tool is never touched.
+    ok_reply = {"jsonrpc": "2.0", "id": 6,
+                "result": {"content": [{"type": "text", "text": "all good"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool", {"toolset_name": "x", "tool_name": "y"}, dict(ok_reply))
+    check("a successful call_tool reply is left untouched",
+          out["result"]["content"][0]["text"] == "all good")
+
+    mcp_bridge.load_cache = real_load_cache
+    mcp_bridge._known_toolsets.clear()
+    mcp_bridge._toolset_tools.clear()
+
+
+def test_resource_templates_answered_locally():
+    """resources/templates/list is answered by the bridge, editor or not.
+
+    The editor advertises a resources capability but answers this method with
+    an error, which some clients (e.g. Cline) take as a reason to redo the
+    whole handshake in a loop. The bridge answers it with an empty list.
+    """
+    print("\n[7] resources/templates/list -> empty list, editor down")
+    tmp = os.path.join(tempfile.mkdtemp(), "templates.json")
+    write_cache(tmp)
+
+    proc = spawn(tmp)
+    out = []
+    reader(proc, out)
+    try:
+        proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": 42, "method": "resources/templates/list",
+            "params": {},
+        }) + "\n")
+        proc.stdin.flush()
+
+        line = await_line(out, timeout=10)
+        check("got a response with the editor down", line is not None)
+        if not line:
+            return
+        msg = json.loads(line)
+        check("response matches request id", msg.get("id") == 42, repr(msg)[:200])
+        check("result is an empty template list",
+              msg.get("result") == {"resourceTemplates": []}, repr(msg)[:200])
+    finally:
+        proc.kill()
+
+
 if __name__ == "__main__":
     print(f"smoke: {BRIDGE}\nsmoke: upstream {DEAD_URL} (intentionally closed)")
     test_survives_absent_editor()
@@ -241,6 +406,8 @@ if __name__ == "__main__":
     test_serves_initialize_from_cache()
     test_survives_non_object_json_lines()
     test_handshake_retry_false_is_a_single_attempt()
+    test_tool_call_hints()
+    test_resource_templates_answered_locally()
     print()
     if failures:
         print(f"FAILED ({len(failures)}): {', '.join(failures)}")

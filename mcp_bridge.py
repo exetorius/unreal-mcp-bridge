@@ -69,6 +69,7 @@ Config (env vars, all optional):
 
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -678,6 +679,182 @@ def _report_unresponsive(err: Exception, is_request: bool, target_id, timeout: f
     })
 
 
+# --------------------------------------------------------------------------- #
+# Tool-call observation (self-correction hints for small/local models)        #
+# --------------------------------------------------------------------------- #
+#
+# Unreal's MCP server groups its many tools into toolsets, reachable through
+# three meta-tools: list_toolsets, describe_toolset, call_tool. A model that
+# gets a toolset_name or tool_name wrong gets back a bare "Unknown tool X" —
+# no hint of the correct toolset or tool names, from either the editor or
+# this bridge. Small local models in particular tend to guess a second
+# plausible-looking name rather than re-querying, which compounds.
+#
+# This section makes the bridge remember, in memory only, the toolset and
+# tool names it has already seen pass through list_toolsets/describe_toolset
+# replies in the current process, and appends them to a failed call_tool's
+# error text. It never changes which reply is sent or retries anything —
+# purely additive, and any failure here is swallowed so a bug in this code
+# can never break the relay it's attached to.
+
+_toolset_lock = threading.Lock()
+_known_toolsets: set[str] = set()
+_toolset_tools: dict[str, set[str]] = {}
+
+# A toolset name is a dotted identifier chain (e.g. "EditorToolset.EditorAppToolset"
+# or "editor_toolset.toolsets.scene.SceneTools") — every name observed live has at
+# least one dot and no whitespace. Several toolset descriptions in list_toolsets are
+# themselves multi-line with their own "- " sub-bullets (prose, not names, e.g.
+# "- System, emitter, and module creation and modification"); without this shape
+# check those get mistaken for toolset names, polluting every hint that follows.
+_TOOLSET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
+
+
+def _record_list_toolsets(text: str) -> None:
+    """Learn toolset names from a successful list_toolsets reply.
+
+    The reply is free text, one "- name: description" line per toolset — but
+    a toolset's own description can itself contain "- " sub-bullets across
+    several lines, so only a line whose pre-":" part looks like a dotted
+    identifier (see _TOOLSET_NAME_RE) is trusted as a real toolset entry.
+    """
+    names = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            name = line[2:].split(":", 1)[0].strip()
+            if name and _TOOLSET_NAME_RE.match(name):
+                names.add(name)
+    if names:
+        with _toolset_lock:
+            _known_toolsets.update(names)
+
+
+def _record_describe_toolset(text: str) -> None:
+    """Learn one toolset's tool names from a successful describe_toolset reply."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return
+    name = data.get("name") if isinstance(data, dict) else None
+    tools = data.get("tools") if isinstance(data, dict) else None
+    if not name or not isinstance(tools, list):
+        return
+    tool_names = {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
+    with _toolset_lock:
+        _known_toolsets.add(name)
+        _toolset_tools[name] = tool_names
+
+
+def _top_level_tool_names() -> set[str]:
+    """Names of the top-level tools, from the tools/list cache.
+
+    call_tool with no toolset_name calls one of these (execute_python_code,
+    deep_research, ...), so they are real targets, not guesses.
+    """
+    tools = (load_cache() or {}).get("tools") or []
+    return {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
+
+
+def _is_known_tool(tool_name: str, known: set[str]) -> bool:
+    """True if tool_name is one of `known`, bare or toolset-qualified.
+
+    call_tool takes the bare name ("get_actors"); describe_toolset may report
+    it qualified ("...SceneTools.get_actors"). Either form counts.
+    """
+    return tool_name in known or any(n.endswith("." + tool_name) for n in known)
+
+
+def _hint_for_call_tool_error(args: dict) -> str | None:
+    """Build a corrective hint for a failed call_tool from what's been cached.
+
+    Only when the name itself is the likely problem: a tool this bridge has
+    seen, called by its right name, failed for its own reasons, and a hint
+    would send the model off guessing a different one. Returns None then, and
+    also when there is nothing useful to add yet — the client sees the
+    original, unannotated error.
+    """
+    if not isinstance(args, dict):
+        return None
+    toolset_name = args.get("toolset_name")
+    tool_name = args.get("tool_name")
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    if not toolset_name:
+        # No toolset_name: dispatched as a top-level tool. If it is one, the
+        # call itself failed and the name is fine. Otherwise the model most
+        # likely forgot toolset_name, the commonest failure observed live.
+        top_level = _top_level_tool_names()
+        if tool_name in top_level:
+            return None
+        with _toolset_lock:
+            toolsets = sorted(_known_toolsets)
+        if not toolsets:
+            return None
+        return (
+            f"No toolset_name was given, so '{tool_name}' was looked up as a "
+            f"top-level tool, and it is not one. Known toolsets so far: "
+            f"{', '.join(toolsets)}. If the tool is in one of these, call "
+            f"describe_toolset on it if you haven't yet, and pass it as "
+            f"toolset_name."
+        )
+    with _toolset_lock:
+        if toolset_name not in _known_toolsets:
+            if not _known_toolsets:
+                return None
+            names = ", ".join(sorted(_known_toolsets))
+            return (
+                f"Toolset '{toolset_name}' was not in this session's "
+                f"list_toolsets. Known toolsets so far: {names}. Call "
+                f"list_toolsets to confirm the exact name before retrying — "
+                f"do not guess another one."
+            )
+        tools = _toolset_tools.get(toolset_name)
+        if tools is None or _is_known_tool(tool_name, tools):
+            return None
+        names = ", ".join(sorted(tools))
+        return (
+            f"Tool '{tool_name}' was not in this session's describe_toolset "
+            f"for '{toolset_name}'. Tool names known there: {names}. Call "
+            f"describe_toolset again if the tool you need isn't in this list "
+            f"— do not guess another one."
+        )
+
+
+def _observe_tool_call_reply(name: str, args: dict, message: dict) -> dict:
+    """Learn from, or annotate, a reply to list_toolsets/describe_toolset/call_tool.
+
+    Passive by design: never changes which reply is sent downstream. A
+    successful list_toolsets or describe_toolset is only recorded for later
+    use; a failed call_tool gets a hint appended to its error text, built
+    solely from names this bridge has itself already seen (it does not know
+    the upstream schema on its own). Any failure here is swallowed — this must
+    never be the reason a reply doesn't reach the client.
+    """
+    try:
+        result = message.get("result")
+        if not isinstance(result, dict):
+            return message
+        content = result.get("content")
+        if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+            return message
+        text = content[0].get("text")
+        if not isinstance(text, str):
+            return message
+
+        if name == "list_toolsets" and not result.get("isError"):
+            _record_list_toolsets(text)
+        elif name == "describe_toolset" and not result.get("isError"):
+            _record_describe_toolset(text)
+        elif name == "call_tool" and result.get("isError"):
+            hint = _hint_for_call_tool_error(args)
+            if hint:
+                content[0]["text"] = text + "\n\n[bridge hint] " + hint
+    except Exception:  # noqa: BLE001 - annotation must never break the relay
+        log("tool-call observation failed:\n" + traceback.format_exc())
+    return message
+
+
 def forward(msg: dict, bounded: bool = True) -> None:
     """Forward a post-init request/notification upstream, recovering sessions.
 
@@ -691,6 +868,14 @@ def forward(msg: dict, bounded: bool = True) -> None:
     target_id = msg.get("id")
     method = msg.get("method", "")
     timeout = TOOL_TIMEOUT if method == "tools/call" else QUICK_TIMEOUT
+    # Only list_toolsets/describe_toolset/call_tool replies are worth
+    # observing (see _observe_tool_call_reply below); everything else is
+    # forwarded exactly as before this feature existed.
+    params = (msg.get("params") or {}) if method == "tools/call" else {}
+    if not isinstance(params, dict):
+        params = {}
+    tool_call_name = params.get("name")
+    tool_call_args = params.get("arguments") or {}
     failed_epoch = -1
     recovered = False
 
@@ -764,6 +949,8 @@ def forward(msg: dict, bounded: bool = True) -> None:
             # stream may stay open for server-push after the reply; we stop once
             # the matching id arrives so the call doesn't hang on it.
             for message in resp.messages():
+                if tool_call_name and message.get("id") == target_id:
+                    message = _observe_tool_call_reply(tool_call_name, tool_call_args, message)
                 write_downstream(message)
                 if is_request and message.get("id") == target_id:
                     break
@@ -848,6 +1035,19 @@ def main() -> None:
                 # Cache-guarded so a cold start with the editor down still
                 # registers a non-empty tool set.
                 threading.Thread(target=_tools_list_worker, args=(msg,), daemon=True).start()
+            elif method == "resources/templates/list":
+                # The upstream Unreal MCP server doesn't implement this method
+                # and answers with a JSON-RPC error, which some clients (e.g.
+                # Cline) appear to treat as a signal to tear down and redo the
+                # whole handshake in a tight loop. Answer locally with an
+                # empty list instead of forwarding it upstream, since this
+                # server has no resource templates to report anyway.
+                if "id" in msg:
+                    write_downstream({
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "result": {"resourceTemplates": []},
+                    })
             else:
                 threading.Thread(target=worker, args=(msg,), daemon=True).start()
         except Exception:  # noqa: BLE001 - the loop must outlive any one message
