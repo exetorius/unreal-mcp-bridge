@@ -746,31 +746,59 @@ def _record_describe_toolset(text: str) -> None:
         _toolset_tools[name] = tool_names
 
 
+def _top_level_tool_names() -> set[str]:
+    """Names of the top-level tools, from the tools/list cache.
+
+    call_tool with no toolset_name calls one of these (execute_python_code,
+    deep_research, ...), so they are real targets, not guesses.
+    """
+    tools = (load_cache() or {}).get("tools") or []
+    return {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
+
+
+def _is_known_tool(tool_name: str, known: set[str]) -> bool:
+    """True if tool_name is one of `known`, bare or toolset-qualified.
+
+    call_tool takes the bare name ("get_actors"); describe_toolset may report
+    it qualified ("...SceneTools.get_actors"). Either form counts.
+    """
+    return tool_name in known or any(n.endswith("." + tool_name) for n in known)
+
+
 def _hint_for_call_tool_error(args: dict) -> str | None:
     """Build a corrective hint for a failed call_tool from what's been cached.
 
-    Returns None when there's nothing useful to add yet (neither list_toolsets
-    nor describe_toolset has been observed this process) — the client then
-    sees the original, unannotated error, same as before this feature existed.
+    Only when the name itself is the likely problem: a tool this bridge has
+    seen, called by its right name, failed for its own reasons, and a hint
+    would send the model off guessing a different one. Returns None then, and
+    also when there is nothing useful to add yet — the client sees the
+    original, unannotated error.
     """
-    toolset_name = args.get("toolset_name") if isinstance(args, dict) else None
+    if not isinstance(args, dict):
+        return None
+    toolset_name = args.get("toolset_name")
+    tool_name = args.get("tool_name")
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    if not toolset_name:
+        # No toolset_name: dispatched as a top-level tool. If it is one, the
+        # call itself failed and the name is fine. Otherwise the model most
+        # likely forgot toolset_name, the commonest failure observed live.
+        top_level = _top_level_tool_names()
+        if tool_name in top_level:
+            return None
+        with _toolset_lock:
+            toolsets = sorted(_known_toolsets)
+        if not toolsets:
+            return None
+        return (
+            f"No toolset_name was given, so '{tool_name}' was looked up as a "
+            f"top-level tool, and it is not one. Known toolsets so far: "
+            f"{', '.join(toolsets)}. If the tool is in one of these, call "
+            f"describe_toolset on it if you haven't yet, and pass it as "
+            f"toolset_name."
+        )
     with _toolset_lock:
-        if not toolset_name:
-            # No toolset_name at all: call_tool dispatched as a top-level tool,
-            # where only list_toolsets/describe_toolset/call_tool exist. This is
-            # the single most common failure this bridge has observed live — a
-            # model guesses a tool name and forgets toolset_name entirely rather
-            # than picking one of the toolsets it already saw.
-            if not _known_toolsets:
-                return None
-            names = ", ".join(sorted(_known_toolsets))
-            return (
-                f"No toolset_name was given, so this dispatched as a top-level "
-                f"tool — only list_toolsets, describe_toolset and call_tool "
-                f"exist there. Known toolsets so far: {names}. Pick one, call "
-                f"describe_toolset on it if you haven't yet, and pass it as "
-                f"toolset_name."
-            )
         if toolset_name not in _known_toolsets:
             if not _known_toolsets:
                 return None
@@ -781,14 +809,16 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
                 f"list_toolsets to confirm the exact name before retrying — "
                 f"do not guess another one."
             )
-        if toolset_name in _toolset_tools:
-            names = ", ".join(sorted(_toolset_tools[toolset_name]))
-            return (
-                f"Tool names known in '{toolset_name}' from this session's "
-                f"describe_toolset: {names}. Call describe_toolset again if the "
-                f"tool you need isn't in this list — do not guess another one."
-            )
-    return None
+        tools = _toolset_tools.get(toolset_name)
+        if tools is None or _is_known_tool(tool_name, tools):
+            return None
+        names = ", ".join(sorted(tools))
+        return (
+            f"Tool '{tool_name}' was not in this session's describe_toolset "
+            f"for '{toolset_name}'. Tool names known there: {names}. Call "
+            f"describe_toolset again if the tool you need isn't in this list "
+            f"— do not guess another one."
+        )
 
 
 def _observe_tool_call_reply(name: str, args: dict, message: dict) -> dict:
@@ -841,7 +871,9 @@ def forward(msg: dict, bounded: bool = True) -> None:
     # Only list_toolsets/describe_toolset/call_tool replies are worth
     # observing (see _observe_tool_call_reply below); everything else is
     # forwarded exactly as before this feature existed.
-    params = msg.get("params") or {} if method == "tools/call" else {}
+    params = (msg.get("params") or {}) if method == "tools/call" else {}
+    if not isinstance(params, dict):
+        params = {}
     tool_call_name = params.get("name")
     tool_call_args = params.get("arguments") or {}
     failed_epoch = -1

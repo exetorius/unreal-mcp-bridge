@@ -248,6 +248,9 @@ def test_tool_call_hints():
 
     mcp_bridge._known_toolsets.clear()
     mcp_bridge._toolset_tools.clear()
+    real_load_cache = mcp_bridge.load_cache
+    mcp_bridge.load_cache = lambda: {"tools": [{"name": "execute_python_code"},
+                                               {"name": "call_tool"}]}
 
     # Nothing observed yet -> no hint, original error untouched.
     untouched = {"jsonrpc": "2.0", "id": 1,
@@ -290,6 +293,17 @@ def test_tool_call_hints():
     check("missing toolset_name gets a hint naming the known toolsets",
           "[bridge hint]" in hinted and "SceneTools" in hinted, hinted)
 
+    # A real top-level tool called with no toolset_name is a correct call that
+    # failed on its own terms — no hint that would send the model guessing.
+    top_level_fail = {"jsonrpc": "2.0", "id": 8,
+                      "result": {"isError": True, "content": [{"type": "text",
+                                 "text": "Traceback: NameError: foo"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool", {"tool_name": "execute_python_code"}, top_level_fail)
+    check("a failing top-level tool is not told it does not exist",
+          out["result"]["content"][0]["text"] == "Traceback: NameError: foo",
+          out["result"]["content"][0]["text"])
+
     # An unknown toolset now gets a hint listing the known ones.
     bad_toolset = {"jsonrpc": "2.0", "id": 3,
                    "result": {"isError": True, "content": [{"type": "text",
@@ -325,6 +339,20 @@ def test_tool_call_hints():
     check("known toolset, bad tool gets a hint naming the real tool names",
           "[bridge hint]" in hinted and "get_actors" in hinted, hinted)
 
+    # The right tool (bare name, as call_tool takes it, against the qualified
+    # names describe_toolset reported) failing at runtime gets no hint.
+    right_tool_fail = {"jsonrpc": "2.0", "id": 9,
+                       "result": {"isError": True, "content": [{"type": "text",
+                                  "text": "Actor not found"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool",
+        {"toolset_name": "editor_toolset.toolsets.scene.SceneTools",
+         "tool_name": "get_actors"},
+        right_tool_fail)
+    check("a known tool failing at runtime is left untouched",
+          out["result"]["content"][0]["text"] == "Actor not found",
+          out["result"]["content"][0]["text"])
+
     # A successful call_tool is never touched.
     ok_reply = {"jsonrpc": "2.0", "id": 6,
                 "result": {"content": [{"type": "text", "text": "all good"}]}}
@@ -333,8 +361,42 @@ def test_tool_call_hints():
     check("a successful call_tool reply is left untouched",
           out["result"]["content"][0]["text"] == "all good")
 
+    mcp_bridge.load_cache = real_load_cache
     mcp_bridge._known_toolsets.clear()
     mcp_bridge._toolset_tools.clear()
+
+
+def test_resource_templates_answered_locally():
+    """resources/templates/list is answered by the bridge, editor or not.
+
+    The editor advertises a resources capability but answers this method with
+    an error, which some clients (e.g. Cline) take as a reason to redo the
+    whole handshake in a loop. The bridge answers it with an empty list.
+    """
+    print("\n[7] resources/templates/list -> empty list, editor down")
+    tmp = os.path.join(tempfile.mkdtemp(), "templates.json")
+    write_cache(tmp)
+
+    proc = spawn(tmp)
+    out = []
+    reader(proc, out)
+    try:
+        proc.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": 42, "method": "resources/templates/list",
+            "params": {},
+        }) + "\n")
+        proc.stdin.flush()
+
+        line = await_line(out, timeout=10)
+        check("got a response with the editor down", line is not None)
+        if not line:
+            return
+        msg = json.loads(line)
+        check("response matches request id", msg.get("id") == 42, repr(msg)[:200])
+        check("result is an empty template list",
+              msg.get("result") == {"resourceTemplates": []}, repr(msg)[:200])
+    finally:
+        proc.kill()
 
 
 if __name__ == "__main__":
@@ -345,6 +407,7 @@ if __name__ == "__main__":
     test_survives_non_object_json_lines()
     test_handshake_retry_false_is_a_single_attempt()
     test_tool_call_hints()
+    test_resource_templates_answered_locally()
     print()
     if failures:
         print(f"FAILED ({len(failures)}): {', '.join(failures)}")
