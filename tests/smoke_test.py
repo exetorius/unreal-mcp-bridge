@@ -315,16 +315,18 @@ def test_tool_call_hints():
     check("unknown toolset gets a hint naming the known ones",
           "[bridge hint]" in hinted and "SceneTools" in hinted, hinted)
 
-    # Observe a describe_toolset reply for one real toolset.
+    # Observe a describe_toolset reply for one real toolset. The editor
+    # reports tool names qualified, but call_tool only takes them bare.
     dt_reply = {"jsonrpc": "2.0", "id": 4, "result": {"content": [{"type": "text", "text":
                 '{"name":"editor_toolset.toolsets.scene.SceneTools","tools":['
                 '{"name":"editor_toolset.toolsets.scene.SceneTools.save_actor"},'
-                '{"name":"editor_toolset.toolsets.scene.SceneTools.get_actors"}]}'}]}}
+                '{"name":"editor_toolset.toolsets.scene.SceneTools.get_actors"},'
+                '{"name":"editor_toolset.toolsets.scene.SceneTools.is_checked_out"}]}'}]}}
     mcp_bridge._observe_tool_call_reply("describe_toolset", {}, dt_reply)
-    check("describe_toolset tool names are learned",
+    check("describe_toolset tool names are learned bare",
           mcp_bridge._toolset_tools.get("editor_toolset.toolsets.scene.SceneTools") ==
-          {"editor_toolset.toolsets.scene.SceneTools.save_actor",
-           "editor_toolset.toolsets.scene.SceneTools.get_actors"})
+          {"save_actor", "get_actors", "is_checked_out"},
+          sorted(mcp_bridge._toolset_tools.get("editor_toolset.toolsets.scene.SceneTools") or []))
 
     # A bad tool name inside a KNOWN toolset now gets the real tool names.
     bad_tool = {"jsonrpc": "2.0", "id": 5,
@@ -338,9 +340,32 @@ def test_tool_call_hints():
     hinted = out["result"]["content"][0]["text"]
     check("known toolset, bad tool gets a hint naming the real tool names",
           "[bridge hint]" in hinted and "get_actors" in hinted, hinted)
+    check("and lists them in the bare form call_tool accepts",
+          "SceneTools.get_actors" not in hinted, hinted)
 
-    # The right tool (bare name, as call_tool takes it, against the qualified
-    # names describe_toolset reported) failing at runtime gets no hint.
+    # The qualified name describe_toolset reported, copied verbatim, is
+    # rejected by the editor: point straight at the bare name, not the list.
+    qualified = {"jsonrpc": "2.0", "id": 10,
+                 "result": {"isError": True, "content": [{"type": "text",
+                            "text": "Unknown tool editor_toolset.toolsets.scene."
+                                    "SceneTools.get_actors"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool",
+        {"toolset_name": "editor_toolset.toolsets.scene.SceneTools",
+         "tool_name": "editor_toolset.toolsets.scene.SceneTools.get_actors"},
+        qualified)
+    hinted = out["result"]["content"][0]["text"]
+    check("qualified name of a known tool gets a bare-name hint",
+          "[bridge hint]" in hinted and "tool_name 'get_actors'" in hinted
+          and "save_actor" not in hinted, hinted)
+    # Spelling out the toolset too: told only "use the bare name", a local
+    # model dropped toolset_name along with the qualifier.
+    check("and it keeps the toolset in the call it asks for",
+          "pass toolset_name 'editor_toolset.toolsets.scene.SceneTools' and "
+          "tool_name 'get_actors'" in hinted, hinted)
+
+    # The right tool, called by its bare name as call_tool takes it, failing
+    # at runtime gets no hint.
     right_tool_fail = {"jsonrpc": "2.0", "id": 9,
                        "result": {"isError": True, "content": [{"type": "text",
                                   "text": "Actor not found"}]}}
@@ -352,6 +377,89 @@ def test_tool_call_hints():
     check("a known tool failing at runtime is left untouched",
           out["result"]["content"][0]["text"] == "Actor not found",
           out["result"]["content"][0]["text"])
+
+    def hint_for(args):
+        """The text a failed call_tool with these args comes back with."""
+        reply = {"jsonrpc": "2.0", "id": 0,
+                 "result": {"isError": True, "content": [{"type": "text",
+                            "text": "Unknown tool"}]}}
+        out = mcp_bridge._observe_tool_call_reply("call_tool", args, reply)
+        return out["result"]["content"][0]["text"]
+
+    scene = "editor_toolset.toolsets.scene.SceneTools"
+
+    # No toolset_name, but the qualified form holds both halves: split it.
+    hinted = hint_for({"tool_name": scene + ".get_actors"})
+    check("qualified name with no toolset_name is split into its two halves",
+          f"pass toolset_name '{scene}' and tool_name 'get_actors'" in hinted, hinted)
+
+    # No toolset_name, bare name of a described tool: name its toolset, not
+    # every known one.
+    hinted = hint_for({"tool_name": "get_actors"})
+    check("known tool with no toolset_name is pointed at its toolset",
+          f"'{scene}' has it" in hinted and "EditorAppToolset" not in hinted, hinted)
+
+    # A toolset name the session never saw, for a tool it has: same.
+    hinted = hint_for({"toolset_name": "SceneTools", "tool_name": "get_actors"})
+    check("unknown toolset, known tool is pointed at the right toolset",
+          f"'{scene}' has it" in hinted and "EditorAppToolset" not in hinted, hinted)
+
+    # Two more toolsets, named as the editor has them: EditorAppToolset is
+    # CamelCase, and is_checked_out is in AssetTools as well as SceneTools.
+    for ts, tools in [("EditorToolset.EditorAppToolset",
+                       ["GetSelectedActors", "GetCameraTransform", "SetCameraTransform"]),
+                      ("editor_toolset.toolsets.asset.AssetTools",
+                       ["is_checked_out", "save_assets"])]:
+        text = json.dumps({"name": ts, "tools": [{"name": f"{ts}.{t}"} for t in tools]})
+        mcp_bridge._observe_tool_call_reply(
+            "describe_toolset", {},
+            {"jsonrpc": "2.0", "id": 0, "result": {"content": [{"type": "text", "text": text}]}})
+
+    # A real tool asked of the wrong toolset, in the other naming style.
+    hinted = hint_for({"toolset_name": scene, "tool_name": "get_selected_actors"})
+    check("tool from another toolset is pointed at, whatever its naming style",
+          "pass toolset_name 'EditorToolset.EditorAppToolset' and tool_name "
+          "'GetSelectedActors'" in hinted, hinted)
+
+    # A tool several toolsets have: list each, let the model pick.
+    hinted = hint_for({"tool_name": "is_checked_out"})
+    check("tool in several toolsets lists each of them",
+          "several have it" in hinted and "AssetTools" in hinted
+          and "SceneTools" in hinted, hinted)
+
+    # Seen from a local model in Cline: the qualified form AND the wrong
+    # toolset ("...ActorTools.find_actors" asked of ActorTools). The lookup
+    # goes by the bare part, so it still finds the toolset that has it.
+    asset = "editor_toolset.toolsets.asset.AssetTools"
+    hinted = hint_for({"toolset_name": asset, "tool_name": asset + ".get_actors"})
+    check("qualified name in the wrong toolset is pointed at the right one",
+          f"pass toolset_name '{scene}' and tool_name 'get_actors'" in hinted, hinted)
+
+    # A short qualifier, as docs write it ("AgentSkillToolset.ListSkills"),
+    # with no toolset_name: found by its bare part all the same.
+    hinted = hint_for({"tool_name": "EditorAppToolset.GetSelectedActors"})
+    check("short-qualified name with no toolset_name finds its toolset",
+          "pass toolset_name 'EditorToolset.EditorAppToolset' and tool_name "
+          "'GetSelectedActors'" in hinted, hinted)
+
+    # A near miss of a tool in the same toolset is suggested, before the list.
+    hinted = hint_for({"toolset_name": scene, "tool_name": "get_actor"})
+    check("near-miss tool name gets a did-you-mean",
+          "Did you mean get_actors?" in hinted, hinted)
+    app = "EditorToolset.EditorAppToolset"
+    hinted = hint_for({"toolset_name": app, "tool_name": "get_camera_transform"})
+    check("so does the same tool in the other naming style",
+          "Did you mean GetCameraTransform?" in hinted, hinted)
+
+    # Never a different verb, however close the spelling: GetCameraTransform
+    # is within the cutoff of this typo too, and so is save_actor of
+    # "set_actor". Taking either would run another action.
+    hinted = hint_for({"toolset_name": app, "tool_name": "SetCameraTransfrom"})
+    check("only a name with the same verb is suggested",
+          "Did you mean SetCameraTransform?" in hinted, hinted)
+    hinted = hint_for({"toolset_name": scene, "tool_name": "set_actor"})
+    check("a different verb is never suggested",
+          "Did you mean" not in hinted, hinted)
 
     # A successful call_tool is never touched.
     ok_reply = {"jsonrpc": "2.0", "id": 6,
