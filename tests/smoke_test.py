@@ -422,6 +422,21 @@ def test_tool_call_hints():
           "several have it" in hinted and "AssetTools" in hinted
           and "SceneTools" in hinted, hinted)
 
+    # Seen from a local model in Cline: the qualified form AND the wrong
+    # toolset ("...ActorTools.find_actors" asked of ActorTools). The lookup
+    # goes by the bare part, so it still finds the toolset that has it.
+    asset = "editor_toolset.toolsets.asset.AssetTools"
+    hinted = hint_for({"toolset_name": asset, "tool_name": asset + ".get_actors"})
+    check("qualified name in the wrong toolset is pointed at the right one",
+          f"pass toolset_name '{scene}' and tool_name 'get_actors'" in hinted, hinted)
+
+    # A short qualifier, as docs write it ("AgentSkillToolset.ListSkills"),
+    # with no toolset_name: found by its bare part all the same.
+    hinted = hint_for({"tool_name": "EditorAppToolset.GetSelectedActors"})
+    check("short-qualified name with no toolset_name finds its toolset",
+          "pass toolset_name 'EditorToolset.EditorAppToolset' and tool_name "
+          "'GetSelectedActors'" in hinted, hinted)
+
     # A near miss of a tool in the same toolset is suggested, before the list.
     hinted = hint_for({"toolset_name": scene, "tool_name": "get_actor"})
     check("near-miss tool name gets a did-you-mean",

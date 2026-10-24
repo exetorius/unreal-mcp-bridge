@@ -829,6 +829,11 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
     tool_name = args.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name:
         return None
+    # A qualified name ("...ActorTools.find_actors", "AgentSkillToolset.ListSkills")
+    # is looked up by its last part, the bare name call_tool wants, whatever
+    # qualifies it: models copy the full form from describe_toolset, or a
+    # short one from docs, and pair it with the wrong toolset just as often.
+    qualifier, _, bare = tool_name.rpartition(".")
     if not toolset_name:
         # No toolset_name: dispatched as a top-level tool. If it is one, the
         # call itself failed and the name is fine. Otherwise the model most
@@ -841,12 +846,11 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
         with _toolset_lock:
             # The qualified form describe_toolset reports holds both halves:
             # split it rather than send the model looking for the toolset.
-            toolset, _, bare = tool_name.rpartition(".")
-            if bare in _toolset_tools.get(toolset, ()):
+            if bare in _toolset_tools.get(qualifier, ()):
                 return (f"{lead} It is the qualified form describe_toolset "
-                        f"reports: pass toolset_name '{toolset}' and tool_name "
+                        f"reports: pass toolset_name '{qualifier}' and tool_name "
                         f"'{bare}'.")
-            homes = _tool_homes(tool_name)
+            homes = _tool_homes(bare)
             toolsets = sorted(_known_toolsets)
         if homes:
             return f"{lead} {_where_to_call(homes)}"
@@ -862,7 +866,7 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
             if not _known_toolsets:
                 return None
             lead = f"Toolset '{toolset_name}' was not in this session's list_toolsets."
-            homes = _tool_homes(tool_name)
+            homes = _tool_homes(bare)
             if homes:
                 return f"{lead} {_where_to_call(homes)}"
             names = ", ".join(sorted(_known_toolsets))
@@ -877,18 +881,17 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
         # The qualified form describe_toolset reports, copied verbatim: the
         # name is right, only its form is wrong, so point at the bare one
         # rather than at a list the model would have to search again.
-        bare = tool_name.removeprefix(toolset_name + ".")
-        if bare != tool_name and bare in tools:
+        if qualifier and bare in tools:
             return (
                 f"call_tool takes the bare tool name, not the qualified one "
                 f"describe_toolset reports. Use the bare name: {bare}"
             )
         # A real tool, just not this toolset's: the model picked the wrong
         # one of two plausible toolsets (e.g. ActorTools for find_actors).
-        homes = _tool_homes(tool_name, exclude=toolset_name)
+        homes = _tool_homes(bare, exclude=toolset_name)
         if homes:
             return f"Tool '{tool_name}' is not in '{toolset_name}'. {_where_to_call(homes)}"
-        close = _close_tool_names(tool_name, tools)
+        close = _close_tool_names(bare, tools)
         guess = f" Did you mean {' or '.join(close)}?" if close else ""
         names = ", ".join(sorted(tools))
         return (
