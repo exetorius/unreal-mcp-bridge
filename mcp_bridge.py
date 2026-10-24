@@ -731,7 +731,12 @@ def _record_list_toolsets(text: str) -> None:
 
 
 def _record_describe_toolset(text: str) -> None:
-    """Learn one toolset's tool names from a successful describe_toolset reply."""
+    """Learn one toolset's tool names from a successful describe_toolset reply.
+
+    describe_toolset reports each tool qualified ("...SceneTools.get_actors"),
+    but call_tool only accepts the bare name ("get_actors"), so names are
+    stored bare: that is the form a hint must show for the model to copy.
+    """
     try:
         data = json.loads(text)
     except (ValueError, TypeError):
@@ -740,7 +745,9 @@ def _record_describe_toolset(text: str) -> None:
     tools = data.get("tools") if isinstance(data, dict) else None
     if not name or not isinstance(tools, list):
         return
-    tool_names = {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
+    prefix = name + "."
+    tool_names = {t["name"].removeprefix(prefix) for t in tools
+                  if isinstance(t, dict) and isinstance(t.get("name"), str) and t["name"]}
     with _toolset_lock:
         _known_toolsets.add(name)
         _toolset_tools[name] = tool_names
@@ -754,15 +761,6 @@ def _top_level_tool_names() -> set[str]:
     """
     tools = (load_cache() or {}).get("tools") or []
     return {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
-
-
-def _is_known_tool(tool_name: str, known: set[str]) -> bool:
-    """True if tool_name is one of `known`, bare or toolset-qualified.
-
-    call_tool takes the bare name ("get_actors"); describe_toolset may report
-    it qualified ("...SceneTools.get_actors"). Either form counts.
-    """
-    return tool_name in known or any(n.endswith("." + tool_name) for n in known)
 
 
 def _hint_for_call_tool_error(args: dict) -> str | None:
@@ -810,8 +808,17 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
                 f"do not guess another one."
             )
         tools = _toolset_tools.get(toolset_name)
-        if tools is None or _is_known_tool(tool_name, tools):
+        if tools is None or tool_name in tools:
             return None
+        # The qualified form describe_toolset reports, copied verbatim: the
+        # name is right, only its form is wrong, so point at the bare one
+        # rather than at a list the model would have to search again.
+        bare = tool_name.removeprefix(toolset_name + ".")
+        if bare != tool_name and bare in tools:
+            return (
+                f"call_tool takes the bare tool name, not the qualified one "
+                f"describe_toolset reports. Use the bare name: {bare}"
+            )
         names = ", ".join(sorted(tools))
         return (
             f"Tool '{tool_name}' was not in this session's describe_toolset "

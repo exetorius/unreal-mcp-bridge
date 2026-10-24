@@ -315,16 +315,17 @@ def test_tool_call_hints():
     check("unknown toolset gets a hint naming the known ones",
           "[bridge hint]" in hinted and "SceneTools" in hinted, hinted)
 
-    # Observe a describe_toolset reply for one real toolset.
+    # Observe a describe_toolset reply for one real toolset. The editor
+    # reports tool names qualified, but call_tool only takes them bare.
     dt_reply = {"jsonrpc": "2.0", "id": 4, "result": {"content": [{"type": "text", "text":
                 '{"name":"editor_toolset.toolsets.scene.SceneTools","tools":['
                 '{"name":"editor_toolset.toolsets.scene.SceneTools.save_actor"},'
                 '{"name":"editor_toolset.toolsets.scene.SceneTools.get_actors"}]}'}]}}
     mcp_bridge._observe_tool_call_reply("describe_toolset", {}, dt_reply)
-    check("describe_toolset tool names are learned",
+    check("describe_toolset tool names are learned bare",
           mcp_bridge._toolset_tools.get("editor_toolset.toolsets.scene.SceneTools") ==
-          {"editor_toolset.toolsets.scene.SceneTools.save_actor",
-           "editor_toolset.toolsets.scene.SceneTools.get_actors"})
+          {"save_actor", "get_actors"},
+          sorted(mcp_bridge._toolset_tools.get("editor_toolset.toolsets.scene.SceneTools") or []))
 
     # A bad tool name inside a KNOWN toolset now gets the real tool names.
     bad_tool = {"jsonrpc": "2.0", "id": 5,
@@ -338,9 +339,27 @@ def test_tool_call_hints():
     hinted = out["result"]["content"][0]["text"]
     check("known toolset, bad tool gets a hint naming the real tool names",
           "[bridge hint]" in hinted and "get_actors" in hinted, hinted)
+    check("and lists them in the bare form call_tool accepts",
+          "SceneTools.get_actors" not in hinted, hinted)
 
-    # The right tool (bare name, as call_tool takes it, against the qualified
-    # names describe_toolset reported) failing at runtime gets no hint.
+    # The qualified name describe_toolset reported, copied verbatim, is
+    # rejected by the editor: point straight at the bare name, not the list.
+    qualified = {"jsonrpc": "2.0", "id": 10,
+                 "result": {"isError": True, "content": [{"type": "text",
+                            "text": "Unknown tool editor_toolset.toolsets.scene."
+                                    "SceneTools.get_actors"}]}}
+    out = mcp_bridge._observe_tool_call_reply(
+        "call_tool",
+        {"toolset_name": "editor_toolset.toolsets.scene.SceneTools",
+         "tool_name": "editor_toolset.toolsets.scene.SceneTools.get_actors"},
+        qualified)
+    hinted = out["result"]["content"][0]["text"]
+    check("qualified name of a known tool gets a bare-name hint",
+          "[bridge hint]" in hinted and "Use the bare name: get_actors" in hinted
+          and "save_actor" not in hinted, hinted)
+
+    # The right tool, called by its bare name as call_tool takes it, failing
+    # at runtime gets no hint.
     right_tool_fail = {"jsonrpc": "2.0", "id": 9,
                        "result": {"isError": True, "content": [{"type": "text",
                                   "text": "Actor not found"}]}}
