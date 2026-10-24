@@ -422,6 +422,25 @@ def test_tool_call_hints():
           "several have it" in hinted and "AssetTools" in hinted
           and "SceneTools" in hinted, hinted)
 
+    # A near miss of a tool in the same toolset is suggested, before the list.
+    hinted = hint_for({"toolset_name": scene, "tool_name": "get_actor"})
+    check("near-miss tool name gets a did-you-mean",
+          "Did you mean get_actors?" in hinted, hinted)
+    app = "EditorToolset.EditorAppToolset"
+    hinted = hint_for({"toolset_name": app, "tool_name": "get_camera_transform"})
+    check("so does the same tool in the other naming style",
+          "Did you mean GetCameraTransform?" in hinted, hinted)
+
+    # Never a different verb, however close the spelling: GetCameraTransform
+    # is within the cutoff of this typo too, and so is save_actor of
+    # "set_actor". Taking either would run another action.
+    hinted = hint_for({"toolset_name": app, "tool_name": "SetCameraTransfrom"})
+    check("only a name with the same verb is suggested",
+          "Did you mean SetCameraTransform?" in hinted, hinted)
+    hinted = hint_for({"toolset_name": scene, "tool_name": "set_actor"})
+    check("a different verb is never suggested",
+          "Did you mean" not in hinted, hinted)
+
     # A successful call_tool is never touched.
     ok_reply = {"jsonrpc": "2.0", "id": 6,
                 "result": {"content": [{"type": "text", "text": "all good"}]}}

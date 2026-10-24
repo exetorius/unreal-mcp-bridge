@@ -67,6 +67,7 @@ Config (env vars, all optional):
   UNREAL_MCP_CACHE         tool-cache path (default tool_cache.json beside script)
 """
 
+import difflib
 import json
 import os
 import re
@@ -794,6 +795,25 @@ def _where_to_call(homes: list[tuple[str, str]]) -> str:
             f"Pass the toolset_name and tool_name of the one you mean.")
 
 
+def _close_tool_names(tool_name: str, tools: set[str]) -> list[str]:
+    """Names in `tools` that look like a misspelling of tool_name.
+
+    Only names starting with the same verb count. By spelling alone
+    get_material is one letter from set_material, and get_all_actors is
+    closest to merge_actors: a model that takes such a suggestion runs a
+    different action, often one that changes the level. Live, ~30 pairs of
+    real tools differ by little more than their verb.
+    """
+    def verb(name: str) -> str:
+        m = re.match(r"[A-Za-z][a-z0-9]*", name)
+        return m.group(0).lower() if m else ""
+
+    want = verb(tool_name)
+    same_verb = {_norm(t): t for t in tools if verb(t) == want}
+    return [same_verb[n] for n in
+            difflib.get_close_matches(_norm(tool_name), same_verb, n=3, cutoff=0.8)]
+
+
 def _hint_for_call_tool_error(args: dict) -> str | None:
     """Build a corrective hint for a failed call_tool from what's been cached.
 
@@ -868,10 +888,12 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
         homes = _tool_homes(tool_name, exclude=toolset_name)
         if homes:
             return f"Tool '{tool_name}' is not in '{toolset_name}'. {_where_to_call(homes)}"
+        close = _close_tool_names(tool_name, tools)
+        guess = f" Did you mean {' or '.join(close)}?" if close else ""
         names = ", ".join(sorted(tools))
         return (
             f"Tool '{tool_name}' was not in this session's describe_toolset "
-            f"for '{toolset_name}'. Tool names known there: {names}. Call "
+            f"for '{toolset_name}'.{guess} Tool names known there: {names}. Call "
             f"describe_toolset again if the tool you need isn't in this list "
             f"— do not guess another one."
         )
