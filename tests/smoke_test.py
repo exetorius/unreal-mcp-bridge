@@ -320,11 +320,12 @@ def test_tool_call_hints():
     dt_reply = {"jsonrpc": "2.0", "id": 4, "result": {"content": [{"type": "text", "text":
                 '{"name":"editor_toolset.toolsets.scene.SceneTools","tools":['
                 '{"name":"editor_toolset.toolsets.scene.SceneTools.save_actor"},'
-                '{"name":"editor_toolset.toolsets.scene.SceneTools.get_actors"}]}'}]}}
+                '{"name":"editor_toolset.toolsets.scene.SceneTools.get_actors"},'
+                '{"name":"editor_toolset.toolsets.scene.SceneTools.is_checked_out"}]}'}]}}
     mcp_bridge._observe_tool_call_reply("describe_toolset", {}, dt_reply)
     check("describe_toolset tool names are learned bare",
           mcp_bridge._toolset_tools.get("editor_toolset.toolsets.scene.SceneTools") ==
-          {"save_actor", "get_actors"},
+          {"save_actor", "get_actors", "is_checked_out"},
           sorted(mcp_bridge._toolset_tools.get("editor_toolset.toolsets.scene.SceneTools") or []))
 
     # A bad tool name inside a KNOWN toolset now gets the real tool names.
@@ -371,6 +372,55 @@ def test_tool_call_hints():
     check("a known tool failing at runtime is left untouched",
           out["result"]["content"][0]["text"] == "Actor not found",
           out["result"]["content"][0]["text"])
+
+    def hint_for(args):
+        """The text a failed call_tool with these args comes back with."""
+        reply = {"jsonrpc": "2.0", "id": 0,
+                 "result": {"isError": True, "content": [{"type": "text",
+                            "text": "Unknown tool"}]}}
+        out = mcp_bridge._observe_tool_call_reply("call_tool", args, reply)
+        return out["result"]["content"][0]["text"]
+
+    scene = "editor_toolset.toolsets.scene.SceneTools"
+
+    # No toolset_name, but the qualified form holds both halves: split it.
+    hinted = hint_for({"tool_name": scene + ".get_actors"})
+    check("qualified name with no toolset_name is split into its two halves",
+          f"pass toolset_name '{scene}' and tool_name 'get_actors'" in hinted, hinted)
+
+    # No toolset_name, bare name of a described tool: name its toolset, not
+    # every known one.
+    hinted = hint_for({"tool_name": "get_actors"})
+    check("known tool with no toolset_name is pointed at its toolset",
+          f"'{scene}' has it" in hinted and "EditorAppToolset" not in hinted, hinted)
+
+    # A toolset name the session never saw, for a tool it has: same.
+    hinted = hint_for({"toolset_name": "SceneTools", "tool_name": "get_actors"})
+    check("unknown toolset, known tool is pointed at the right toolset",
+          f"'{scene}' has it" in hinted and "EditorAppToolset" not in hinted, hinted)
+
+    # Two more toolsets, named as the editor has them: EditorAppToolset is
+    # CamelCase, and is_checked_out is in AssetTools as well as SceneTools.
+    for ts, tools in [("EditorToolset.EditorAppToolset",
+                       ["GetSelectedActors", "GetCameraTransform", "SetCameraTransform"]),
+                      ("editor_toolset.toolsets.asset.AssetTools",
+                       ["is_checked_out", "save_assets"])]:
+        text = json.dumps({"name": ts, "tools": [{"name": f"{ts}.{t}"} for t in tools]})
+        mcp_bridge._observe_tool_call_reply(
+            "describe_toolset", {},
+            {"jsonrpc": "2.0", "id": 0, "result": {"content": [{"type": "text", "text": text}]}})
+
+    # A real tool asked of the wrong toolset, in the other naming style.
+    hinted = hint_for({"toolset_name": scene, "tool_name": "get_selected_actors"})
+    check("tool from another toolset is pointed at, whatever its naming style",
+          "pass toolset_name 'EditorToolset.EditorAppToolset' and tool_name "
+          "'GetSelectedActors'" in hinted, hinted)
+
+    # A tool several toolsets have: list each, let the model pick.
+    hinted = hint_for({"tool_name": "is_checked_out"})
+    check("tool in several toolsets lists each of them",
+          "several have it" in hinted and "AssetTools" in hinted
+          and "SceneTools" in hinted, hinted)
 
     # A successful call_tool is never touched.
     ok_reply = {"jsonrpc": "2.0", "id": 6,
