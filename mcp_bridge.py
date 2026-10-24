@@ -880,11 +880,14 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
             return None
         # The qualified form describe_toolset reports, copied verbatim: the
         # name is right, only its form is wrong, so point at the bare one
-        # rather than at a list the model would have to search again.
+        # rather than at a list the model would have to search again. Both
+        # arguments are spelled out: told only "use the bare name", a local
+        # model dropped toolset_name along with the qualifier.
         if qualifier and bare in tools:
             return (
                 f"call_tool takes the bare tool name, not the qualified one "
-                f"describe_toolset reports. Use the bare name: {bare}"
+                f"describe_toolset reports. Keep the toolset: pass toolset_name "
+                f"'{toolset_name}' and tool_name '{bare}'."
             )
         # A real tool, just not this toolset's: the model picked the wrong
         # one of two plausible toolsets (e.g. ActorTools for find_actors).

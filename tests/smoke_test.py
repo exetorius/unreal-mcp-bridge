@@ -356,8 +356,13 @@ def test_tool_call_hints():
         qualified)
     hinted = out["result"]["content"][0]["text"]
     check("qualified name of a known tool gets a bare-name hint",
-          "[bridge hint]" in hinted and "Use the bare name: get_actors" in hinted
+          "[bridge hint]" in hinted and "tool_name 'get_actors'" in hinted
           and "save_actor" not in hinted, hinted)
+    # Spelling out the toolset too: told only "use the bare name", a local
+    # model dropped toolset_name along with the qualifier.
+    check("and it keeps the toolset in the call it asks for",
+          "pass toolset_name 'editor_toolset.toolsets.scene.SceneTools' and "
+          "tool_name 'get_actors'" in hinted, hinted)
 
     # The right tool, called by its bare name as call_tool takes it, failing
     # at runtime gets no hint.
