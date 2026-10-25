@@ -67,6 +67,7 @@ Config (env vars, all optional):
   UNREAL_MCP_CACHE         tool-cache path (default tool_cache.json beside script)
 """
 
+import difflib
 import json
 import os
 import re
@@ -731,7 +732,12 @@ def _record_list_toolsets(text: str) -> None:
 
 
 def _record_describe_toolset(text: str) -> None:
-    """Learn one toolset's tool names from a successful describe_toolset reply."""
+    """Learn one toolset's tool names from a successful describe_toolset reply.
+
+    describe_toolset reports each tool qualified ("...SceneTools.get_actors"),
+    but call_tool only accepts the bare name ("get_actors"), so names are
+    stored bare: that is the form a hint must show for the model to copy.
+    """
     try:
         data = json.loads(text)
     except (ValueError, TypeError):
@@ -740,7 +746,9 @@ def _record_describe_toolset(text: str) -> None:
     tools = data.get("tools") if isinstance(data, dict) else None
     if not name or not isinstance(tools, list):
         return
-    tool_names = {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
+    prefix = name + "."
+    tool_names = {t["name"].removeprefix(prefix) for t in tools
+                  if isinstance(t, dict) and isinstance(t.get("name"), str) and t["name"]}
     with _toolset_lock:
         _known_toolsets.add(name)
         _toolset_tools[name] = tool_names
@@ -756,13 +764,54 @@ def _top_level_tool_names() -> set[str]:
     return {t.get("name") for t in tools if isinstance(t, dict) and t.get("name")}
 
 
-def _is_known_tool(tool_name: str, known: set[str]) -> bool:
-    """True if tool_name is one of `known`, bare or toolset-qualified.
+def _norm(name: str) -> str:
+    """Fold a tool name for comparison: case and underscores dropped.
 
-    call_tool takes the bare name ("get_actors"); describe_toolset may report
-    it qualified ("...SceneTools.get_actors"). Either form counts.
+    Both styles exist side by side (EditorAppToolset's GetSelectedActors,
+    SceneTools' get_current_level), and a model mixes them up freely.
     """
-    return tool_name in known or any(n.endswith("." + tool_name) for n in known)
+    return name.replace("_", "").lower()
+
+
+def _tool_homes(tool_name: str, exclude: str | None = None) -> list[tuple[str, str]]:
+    """(toolset, tool) for each described toolset with a tool by this name.
+
+    Matched through _norm, so the exact name to call comes back with it.
+    Caller holds _toolset_lock.
+    """
+    want = _norm(tool_name)
+    return sorted((ts, t) for ts, tools in _toolset_tools.items() if ts != exclude
+                  for t in tools if _norm(t) == want)
+
+
+def _where_to_call(homes: list[tuple[str, str]]) -> str:
+    """Tell the model exactly what to pass for a tool found in `homes`."""
+    if len(homes) == 1:
+        ts, tool = homes[0]
+        return (f"Of the toolsets described so far, '{ts}' has it: pass "
+                f"toolset_name '{ts}' and tool_name '{tool}'.")
+    found = ", ".join(f"'{tool}' in '{ts}'" for ts, tool in homes)
+    return (f"Of the toolsets described so far, several have it: {found}. "
+            f"Pass the toolset_name and tool_name of the one you mean.")
+
+
+def _close_tool_names(tool_name: str, tools: set[str]) -> list[str]:
+    """Names in `tools` that look like a misspelling of tool_name.
+
+    Only names starting with the same verb count. By spelling alone
+    get_material is one letter from set_material, and get_all_actors is
+    closest to merge_actors: a model that takes such a suggestion runs a
+    different action, often one that changes the level. Live, ~30 pairs of
+    real tools differ by little more than their verb.
+    """
+    def verb(name: str) -> str:
+        m = re.match(r"[A-Za-z][a-z0-9]*", name)
+        return m.group(0).lower() if m else ""
+
+    want = verb(tool_name)
+    same_verb = {_norm(t): t for t in tools if verb(t) == want}
+    return [same_verb[n] for n in
+            difflib.get_close_matches(_norm(tool_name), same_verb, n=3, cutoff=0.8)]
 
 
 def _hint_for_call_tool_error(args: dict) -> str | None:
@@ -780,6 +829,11 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
     tool_name = args.get("tool_name")
     if not isinstance(tool_name, str) or not tool_name:
         return None
+    # A qualified name ("...ActorTools.find_actors", "AgentSkillToolset.ListSkills")
+    # is looked up by its last part, the bare name call_tool wants, whatever
+    # qualifies it: models copy the full form from describe_toolset, or a
+    # short one from docs, and pair it with the wrong toolset just as often.
+    qualifier, _, bare = tool_name.rpartition(".")
     if not toolset_name:
         # No toolset_name: dispatched as a top-level tool. If it is one, the
         # call itself failed and the name is fine. Otherwise the model most
@@ -787,35 +841,65 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
         top_level = _top_level_tool_names()
         if tool_name in top_level:
             return None
+        lead = (f"No toolset_name was given, so '{tool_name}' was looked up as a "
+                f"top-level tool, and it is not one.")
         with _toolset_lock:
+            # The qualified form describe_toolset reports holds both halves:
+            # split it rather than send the model looking for the toolset.
+            if bare in _toolset_tools.get(qualifier, ()):
+                return (f"{lead} It is the qualified form describe_toolset "
+                        f"reports: pass toolset_name '{qualifier}' and tool_name "
+                        f"'{bare}'.")
+            homes = _tool_homes(bare)
             toolsets = sorted(_known_toolsets)
+        if homes:
+            return f"{lead} {_where_to_call(homes)}"
         if not toolsets:
             return None
         return (
-            f"No toolset_name was given, so '{tool_name}' was looked up as a "
-            f"top-level tool, and it is not one. Known toolsets so far: "
-            f"{', '.join(toolsets)}. If the tool is in one of these, call "
-            f"describe_toolset on it if you haven't yet, and pass it as "
-            f"toolset_name."
+            f"{lead} Known toolsets so far: {', '.join(toolsets)}. If the tool "
+            f"is in one of these, call describe_toolset on it if you haven't "
+            f"yet, and pass it as toolset_name."
         )
     with _toolset_lock:
         if toolset_name not in _known_toolsets:
             if not _known_toolsets:
                 return None
+            lead = f"Toolset '{toolset_name}' was not in this session's list_toolsets."
+            homes = _tool_homes(bare)
+            if homes:
+                return f"{lead} {_where_to_call(homes)}"
             names = ", ".join(sorted(_known_toolsets))
             return (
-                f"Toolset '{toolset_name}' was not in this session's "
-                f"list_toolsets. Known toolsets so far: {names}. Call "
-                f"list_toolsets to confirm the exact name before retrying — "
-                f"do not guess another one."
+                f"{lead} Known toolsets so far: {names}. Call list_toolsets to "
+                f"confirm the exact name before retrying — do not guess "
+                f"another one."
             )
         tools = _toolset_tools.get(toolset_name)
-        if tools is None or _is_known_tool(tool_name, tools):
+        if tools is None or tool_name in tools:
             return None
+        # The qualified form describe_toolset reports, copied verbatim: the
+        # name is right, only its form is wrong, so point at the bare one
+        # rather than at a list the model would have to search again. Both
+        # arguments are spelled out: told only "use the bare name", a local
+        # model dropped toolset_name along with the qualifier.
+        if qualifier and bare in tools:
+            return (
+                f"call_tool takes the bare tool name, not the qualified one "
+                f"describe_toolset reports. Keep the toolset: pass toolset_name "
+                f"'{toolset_name}' and tool_name '{bare}'."
+            )
+        # A real tool, just not this toolset's: the model picked the wrong
+        # one of two plausible toolsets (e.g. ActorTools for find_actors).
+        homes = _tool_homes(bare, exclude=toolset_name)
+        if homes:
+            return f"Tool '{tool_name}' is not in '{toolset_name}'. {_where_to_call(homes)}"
+        close = _close_tool_names(bare, tools)
+        guess = f" Did you mean {' or '.join(close)}?" if close else ""
         names = ", ".join(sorted(tools))
         return (
             f"Tool '{tool_name}' was not in this session's describe_toolset "
-            f"for '{toolset_name}'. Tool names known there: {names}. Call "
+            f"for '{toolset_name}'.{guess} Tool names known there: {names}. Call "
             f"describe_toolset again if the tool you need isn't in this list "
             f"— do not guess another one."
         )
