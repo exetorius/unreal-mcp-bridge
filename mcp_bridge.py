@@ -889,6 +889,16 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
                 f"describe_toolset reports. Keep the toolset: pass toolset_name "
                 f"'{toolset_name}' and tool_name '{bare}'."
             )
+        # The right toolset, the name in its other style (get_selected_actors
+        # for EditorAppToolset's GetSelectedActors): give the exact spelling
+        # here before looking elsewhere, or a twin in that style in another
+        # toolset would send the model away from the one it rightly chose.
+        same = sorted(t for t in tools if _norm(t) == _norm(bare))
+        if same:
+            return (
+                f"Tool '{tool_name}' is spelled '{same[0]}' in '{toolset_name}': "
+                f"pass toolset_name '{toolset_name}' and tool_name '{same[0]}'."
+            )
         # A real tool, just not this toolset's: the model picked the wrong
         # one of two plausible toolsets (e.g. ActorTools for find_actors).
         homes = _tool_homes(bare, exclude=toolset_name)
