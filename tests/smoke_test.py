@@ -507,6 +507,97 @@ def test_resource_templates_answered_locally():
         proc.kill()
 
 
+def test_compact_describe():
+    """UNREAL_MCP_COMPACT_DESCRIBE trims descriptions, never what builds args.
+
+    Unit test on the reply rewrite itself, with a describe_toolset reply
+    shaped like the editor's: docstring descriptions with Args:/Returns:
+    sections, and the UObject reference schema every object argument repeats.
+    """
+    print("\n[9] compact describe_toolset trims descriptions only")
+    sys.path.insert(0, ROOT)
+    import mcp_bridge
+
+    check("off unless UNREAL_MCP_COMPACT_DESCRIBE=1", mcp_bridge.COMPACT_DESCRIBE is False)
+
+    ref = {"type": "object", "title": "/Script/Engine.Actor",
+           "description": "Represents a reference to a UObject or UClass.",
+           "properties": {"refPath": {
+               "type": "string", "description": "The reference stored as a soft path string."}},
+           "required": ["refPath"]}
+    data = {"name": "Smoke.SceneTools", "version": "1.0", "description": "Scene tools.", "tools": [
+        {"description": "Saves the actor to disk.\n\n        Args:\n            actor: The actor "
+                        "to save.\n\n        Returns:\n            True if it was saved.",
+         "name": "Smoke.SceneTools.save_actor",
+         "inputSchema": {"type": "object", "properties": {"actor": ref}, "required": ["actor"]},
+         "outputSchema": {"type": "object", "properties": {"returnValue": {"type": "boolean"}}}},
+        {"description": "Moves an actor.\n\n        Args:\n            actor: The actor to move."
+                        "\n\n        Returns:\n            Where it ended up.",
+         "name": "Smoke.SceneTools.move_actor",
+         "inputSchema": {"type": "object", "properties": {
+             "actor": ref,
+             "mode": {"type": "string", "title": "EMoveMode", "enum": ["Snap", "Free"],
+                      "default": "Snap", "description": "How to move it."},
+             "description": {"type": "string"}},
+             "required": ["actor", "mode"]}},
+        # As BlueprintTools' add_object_function_param has it: no blank line
+        # between the Args: lines and Returns:.
+        {"description": "Adds a param.\n\n        Args:\n            name: Its name.\n"
+                        "        Returns:\n            The new pin.",
+         "name": "Smoke.SceneTools.add_param",
+         "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
+         "outputSchema": {"type": "object", "properties": {"returnValue": {"type": "string"}}}},
+    ]}
+    reply = {"jsonrpc": "2.0", "id": 1,
+             "result": {"content": [{"type": "text", "text": json.dumps(data)}]}}
+    out = mcp_bridge._compact_describe_reply(json.loads(json.dumps(reply)))
+    got = json.loads(out["result"]["content"][0]["text"])
+    save, move, add = got["tools"]
+    moved_actor = move["inputSchema"]["properties"]["actor"]
+
+    check("a Returns: section is dropped when an outputSchema says the same",
+          "Returns:" not in save["description"]
+          and "True if it was saved" not in save["description"], save["description"])
+    check("the summary and Args: section are kept as they were",
+          save["description"] == data["tools"][0]["description"].split("\n\n        Returns:")[0],
+          save["description"])
+    check("so is one right after the Args: lines",
+          add["description"] == "Adds a param.\n\n        Args:\n            name: Its name.",
+          add["description"])
+    check("a tool with no outputSchema keeps its Returns: section",
+          move["description"] == data["tools"][1]["description"], move["description"])
+    check("a schema description already seen in the reply is dropped",
+          "description" not in moved_actor
+          and "description" not in moved_actor["properties"]["refPath"], json.dumps(moved_actor))
+    check("its first occurrence is kept",
+          save["inputSchema"]["properties"]["actor"]["description"] == ref["description"],
+          json.dumps(save["inputSchema"]["properties"]["actor"]))
+    check("a description seen once is kept",
+          move["inputSchema"]["properties"]["mode"].get("description") == "How to move it.")
+
+    def without_descriptions(node):
+        """Everything but description strings: what a model builds arguments from."""
+        if isinstance(node, dict):
+            return {k: without_descriptions(v) for k, v in node.items()
+                    if not (k == "description" and isinstance(v, str))}
+        if isinstance(node, list):
+            return [without_descriptions(v) for v in node]
+        return node
+
+    check("names, types, properties, required, enums, defaults and titles are untouched "
+          "(a property named description included)",
+          without_descriptions(got) == without_descriptions(data))
+
+    error_reply = {"jsonrpc": "2.0", "id": 2, "result": {"isError": True, "content": [
+        {"type": "text", "text": "Toolset 'Smoke.Nope' not found"}]}}
+    text_reply = {"jsonrpc": "2.0", "id": 3, "result": {"content": [
+        {"type": "text", "text": "not JSON at all"}]}}
+    for name, msg in (("an error reply", error_reply), ("a non-JSON reply", text_reply)):
+        before = json.dumps(msg)
+        check(f"{name} is forwarded as it was",
+              json.dumps(mcp_bridge._compact_describe_reply(msg)) == before)
+
+
 if __name__ == "__main__":
     print(f"smoke: {BRIDGE}\nsmoke: upstream {DEAD_URL} (intentionally closed)")
     test_survives_absent_editor()
@@ -515,6 +606,7 @@ if __name__ == "__main__":
     test_survives_non_object_json_lines()
     test_handshake_retry_false_is_a_single_attempt()
     test_tool_call_hints()
+    test_compact_describe()
     test_resource_templates_answered_locally()
     print()
     if failures:
