@@ -491,6 +491,130 @@ def test_tool_call_hints():
     mcp_bridge._toolset_tools.clear()
 
 
+def test_auto_describe_on_failure():
+    """A failed call_tool on a listed, never-described toolset gets it described.
+
+    The bridge sends describe_toolset itself, on an id of its own, so the
+    hint has names to offer; the reply is read, never forwarded. Against a
+    fake editor: the hint then lists the real tools, each toolset is described
+    at most once, a toolset never listed is never asked about, and a describe
+    that stalls or fails leaves the error exactly as it was, within the short
+    timeout.
+    """
+    print("\n[8] failed call_tool on an undescribed toolset -> the bridge describes it")
+    sys.path.insert(0, ROOT)
+    import mcp_bridge
+
+    asked = []  # (id, toolset_name) of each describe_toolset the fake editor got
+    release = threading.Event()
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+
+    def handle(conn):
+        with conn:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                data += chunk
+            head, _, body = data.partition(b"\r\n\r\n")
+            length = next(int(line.split(b":", 1)[1]) for line in head.split(b"\r\n")
+                          if line.lower().startswith(b"content-length:"))
+            while len(body) < length:
+                body += conn.recv(65536)
+            req = json.loads(body)
+            ts = req["params"]["arguments"]["toolset_name"]
+            asked.append((req["id"], ts))
+            if ts == "Fake.StalledTools":
+                release.wait(10)  # accepted, never answered
+                return
+            if ts == "Fake.AssetTools":
+                tools = [{"name": f"{ts}.{t}"}
+                         for t in ("find_assets", "get_asset_metadata", "save_assets")]
+                result = {"content": [{"type": "text",
+                                       "text": json.dumps({"name": ts, "tools": tools})}]}
+            else:
+                result = {"isError": True,
+                          "content": [{"type": "text", "text": f"Unknown toolset {ts}"}]}
+            event = json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": result})
+            # A tools/call reply comes as an SSE stream, as the editor sends it.
+            conn.sendall(("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                          f"event: message\ndata: {event}\n\n").encode())
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    saved = (mcp_bridge.HOST, mcp_bridge.PORT, mcp_bridge.DESCRIBE_TIMEOUT,
+             mcp_bridge.state.session_id)
+    mcp_bridge.HOST, mcp_bridge.PORT = "127.0.0.1", srv.getsockname()[1]
+    mcp_bridge.DESCRIBE_TIMEOUT = 1.0
+    mcp_bridge.state.session_id = "sess-smoke"
+    mcp_bridge._known_toolsets.clear()
+    mcp_bridge._toolset_tools.clear()
+    mcp_bridge._describe_attempted.clear()
+
+    def hint_for(args):
+        """The text a failed call_tool with these args comes back with."""
+        reply = {"jsonrpc": "2.0", "id": 0,
+                 "result": {"isError": True, "content": [{"type": "text",
+                            "text": "Unknown tool"}]}}
+        out = mcp_bridge._observe_tool_call_reply("call_tool", args, reply)
+        return out["result"]["content"][0]["text"]
+
+    try:
+        mcp_bridge._observe_tool_call_reply(
+            "list_toolsets", {},
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text":
+             "- Fake.AssetTools: assets\n- Fake.StalledTools: stalls\n"
+             "- Fake.BrokenTools: fails\n"}]}})
+
+        # Seen from a local model: guessing in AssetTools, never described.
+        hinted = hint_for({"toolset_name": "Fake.AssetTools", "tool_name": "list_assets"})
+        check("a listed, undescribed toolset is described by the bridge",
+              [ts for _, ts in asked] == ["Fake.AssetTools"], repr(asked))
+        check("on a request id of its own",
+              bool(asked) and str(asked[0][0]).startswith("__bridge_"), repr(asked))
+        check("and the hint lists the tools it found there",
+              "[bridge hint]" in hinted and "find_assets" in hinted, hinted)
+
+        hinted = hint_for({"toolset_name": "Fake.AssetTools", "tool_name": "get_asset"})
+        check("a described toolset is not described again",
+              len(asked) == 1 and "find_assets" in hinted, repr(asked))
+
+        hint_for({"toolset_name": "Fake.Guessed", "tool_name": "list_assets"})
+        check("a toolset never listed is never asked about", len(asked) == 1, repr(asked))
+
+        t0 = time.monotonic()
+        hinted = hint_for({"toolset_name": "Fake.StalledTools", "tool_name": "x"})
+        elapsed = time.monotonic() - t0
+        check("a stalled describe leaves the error as it was", hinted == "Unknown tool", hinted)
+        check("within the short timeout", elapsed < 3, f"took {elapsed:.1f}s")
+        hint_for({"toolset_name": "Fake.StalledTools", "tool_name": "y"})
+        check("and is not retried on the next failure",
+              [ts for _, ts in asked].count("Fake.StalledTools") == 1, repr(asked))
+
+        hinted = hint_for({"toolset_name": "Fake.BrokenTools", "tool_name": "x"})
+        check("a failing describe leaves the error as it was", hinted == "Unknown tool", hinted)
+    finally:
+        release.set()
+        srv.close()
+        (mcp_bridge.HOST, mcp_bridge.PORT, mcp_bridge.DESCRIBE_TIMEOUT,
+         mcp_bridge.state.session_id) = saved
+        mcp_bridge._known_toolsets.clear()
+        mcp_bridge._toolset_tools.clear()
+        mcp_bridge._describe_attempted.clear()
+
+
 def test_resource_templates_answered_locally():
     """resources/templates/list is answered by the bridge, editor or not.
 
@@ -533,6 +657,7 @@ if __name__ == "__main__":
     test_handshake_retry_false_is_a_single_attempt()
     test_tool_call_hints()
     test_resource_templates_answered_locally()
+    test_auto_describe_on_failure()
     print()
     if failures:
         print(f"FAILED ({len(failures)}): {', '.join(failures)}")
