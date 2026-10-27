@@ -65,9 +65,12 @@ Config (env vars, all optional):
   UNREAL_MCP_TOOL_TIMEOUT  socket timeout for tool calls, seconds (default 600)
   UNREAL_MCP_QUICK_TIMEOUT socket timeout for handshake/list, seconds (default 30)
   UNREAL_MCP_CACHE         tool-cache path (default tool_cache.json beside script)
+  UNREAL_MCP_DESCRIBE_TIMEOUT socket timeout for the bridge's own describe_toolset
+                           on a failed call_tool, seconds (default 5)
 """
 
 import difflib
+import itertools
 import json
 import os
 import re
@@ -89,6 +92,12 @@ CONNECT_TIMEOUT = 5.0
 # started responding, and a genuinely slow tool gets its whole allowance for
 # the body. Capped at the caller's timeout so a shorter one still wins.
 HEADER_TIMEOUT = float(os.environ.get("UNREAL_MCP_HEADER_TIMEOUT", "20"))
+
+# Socket timeout for the describe_toolset the bridge sends on its own account
+# when a call_tool fails against a toolset listed but never described (see
+# _describe_unseen_toolset). Short on purpose: the client is waiting for the
+# failed call's reply meanwhile, and a hint is not worth a long wait.
+DESCRIBE_TIMEOUT = float(os.environ.get("UNREAL_MCP_DESCRIBE_TIMEOUT", "5"))
 
 _parsed = urlparse(UPSTREAM_URL)
 HOST = _parsed.hostname or "127.0.0.1"
@@ -697,10 +706,21 @@ def _report_unresponsive(err: Exception, is_request: bool, target_id, timeout: f
 # error text. It never changes which reply is sent or retries anything —
 # purely additive, and any failure here is swallowed so a bug in this code
 # can never break the relay it's attached to.
+#
+# One upstream call of its own: when a call_tool fails against a toolset that
+# was listed but never described, the bridge describes it to have names to
+# hint with (see _describe_unseen_toolset). The reply is read here and never
+# forwarded, so the model pays nothing for it.
 
 _toolset_lock = threading.Lock()
 _known_toolsets: set[str] = set()
 _toolset_tools: dict[str, set[str]] = {}
+_describe_attempted: set[str] = set()
+
+# Ids for the bridge's own requests are strings under a "__bridge_" prefix, as
+# reconcile_tools' are, so they cannot collide with a client's ids in the same
+# upstream session.
+_bridge_request_ids = itertools.count(1)
 
 # A toolset name is a dotted identifier chain (e.g. "EditorToolset.EditorAppToolset"
 # or "editor_toolset.toolsets.scene.SceneTools") — every name observed live has at
@@ -889,6 +909,16 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
                 f"describe_toolset reports. Keep the toolset: pass toolset_name "
                 f"'{toolset_name}' and tool_name '{bare}'."
             )
+        # The right toolset, the name in its other style (get_selected_actors
+        # for EditorAppToolset's GetSelectedActors): give the exact spelling
+        # here before looking elsewhere, or a twin in that style in another
+        # toolset would send the model away from the one it rightly chose.
+        same = sorted(t for t in tools if _norm(t) == _norm(bare))
+        if same:
+            return (
+                f"Tool '{tool_name}' is spelled '{same[0]}' in '{toolset_name}': "
+                f"pass toolset_name '{toolset_name}' and tool_name '{same[0]}'."
+            )
         # A real tool, just not this toolset's: the model picked the wrong
         # one of two plausible toolsets (e.g. ActorTools for find_actors).
         homes = _tool_homes(bare, exclude=toolset_name)
@@ -905,14 +935,68 @@ def _hint_for_call_tool_error(args: dict) -> str | None:
         )
 
 
+def _describe_unseen_toolset(args: dict) -> None:
+    """Describe the toolset a failed call_tool named, if it was never described.
+
+    Without its tool names a hint has nothing to offer. A local model was seen
+    guessing three AssetTools names in a row (get_asset_info, get_asset,
+    list_assets) without ever describing it, each answered by a bare "Unknown
+    tool". Only a toolset seen in list_toolsets is described, once per process:
+    a guessed toolset name would only fail upstream too, and a toolset that
+    could not be described is not worth another wait on the next failure. On
+    any failure the hint is built from what was already known, as before.
+
+    Sent on the current session, with no reconnect: the failed call's
+    reply has just come from the editor, and recovering a session is
+    forward()'s job. Waiting on state.lock behind another worker's reconnect
+    would also break the short timeout this wait is bounded by.
+    """
+    if not isinstance(args, dict):
+        return
+    toolset_name = args.get("toolset_name")
+    tool_name = args.get("tool_name")
+    if not toolset_name and isinstance(tool_name, str):
+        # No toolset_name: the qualified form describe_toolset reports names it.
+        toolset_name = tool_name.rpartition(".")[0]
+    if not isinstance(toolset_name, str) or not toolset_name:
+        return
+    with _toolset_lock:
+        if (toolset_name not in _known_toolsets or toolset_name in _toolset_tools
+                or toolset_name in _describe_attempted):
+            return
+        _describe_attempted.add(toolset_name)
+    request = {"jsonrpc": "2.0", "id": f"__bridge_describe_{next(_bridge_request_ids)}__",
+               "method": "tools/call",
+               "params": {"name": "describe_toolset",
+                          "arguments": {"toolset_name": toolset_name}}}
+    try:
+        resp = _http_request(request, state.session_id, DESCRIBE_TIMEOUT)
+        try:
+            replies = resp.messages() if resp.status < 400 else iter(())
+            reply = next((m for m in replies if m.get("id") == request["id"]), None)
+        finally:
+            resp.close()
+    except Exception as err:  # noqa: BLE001 - a hint is never worth an error
+        log(f"describe_toolset for a hint on '{toolset_name}' failed ({err!r}); "
+            f"hinting from what is known")
+        return
+    if reply is not None:
+        _observe_tool_call_reply("describe_toolset", {}, reply)
+    with _toolset_lock:
+        described = toolset_name in _toolset_tools
+    log(f"described '{toolset_name}' for a hint" if described else
+        f"describe_toolset for a hint on '{toolset_name}' gave no tool names")
+
+
 def _observe_tool_call_reply(name: str, args: dict, message: dict) -> dict:
     """Learn from, or annotate, a reply to list_toolsets/describe_toolset/call_tool.
 
     Passive by design: never changes which reply is sent downstream. A
     successful list_toolsets or describe_toolset is only recorded for later
-    use; a failed call_tool gets a hint appended to its error text, built
-    solely from names this bridge has itself already seen (it does not know
-    the upstream schema on its own). Any failure here is swallowed — this must
+    use; a failed call_tool gets a hint appended to its error text, built from
+    names this bridge has seen, plus at most one describe_toolset of its own
+    when the toolset named was listed but never described (see
+    _describe_unseen_toolset). Any failure here is swallowed — this must
     never be the reason a reply doesn't reach the client.
     """
     try:
@@ -931,6 +1015,7 @@ def _observe_tool_call_reply(name: str, args: dict, message: dict) -> dict:
         elif name == "describe_toolset" and not result.get("isError"):
             _record_describe_toolset(text)
         elif name == "call_tool" and result.get("isError"):
+            _describe_unseen_toolset(args)
             hint = _hint_for_call_tool_error(args)
             if hint:
                 content[0]["text"] = text + "\n\n[bridge hint] " + hint
