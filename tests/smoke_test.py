@@ -386,6 +386,13 @@ def test_tool_call_hints():
         out = mcp_bridge._observe_tool_call_reply("call_tool", args, reply)
         return out["result"]["content"][0]["text"]
 
+    def describe(ts, tools):
+        """Observe a describe_toolset reply for `ts`, names qualified as the editor sends them."""
+        text = json.dumps({"name": ts, "tools": [{"name": f"{ts}.{t}"} for t in tools]})
+        mcp_bridge._observe_tool_call_reply(
+            "describe_toolset", {},
+            {"jsonrpc": "2.0", "id": 0, "result": {"content": [{"type": "text", "text": text}]}})
+
     scene = "editor_toolset.toolsets.scene.SceneTools"
 
     # No toolset_name, but the qualified form holds both halves: split it.
@@ -410,10 +417,7 @@ def test_tool_call_hints():
                        ["GetSelectedActors", "GetCameraTransform", "SetCameraTransform"]),
                       ("editor_toolset.toolsets.asset.AssetTools",
                        ["is_checked_out", "save_assets"])]:
-        text = json.dumps({"name": ts, "tools": [{"name": f"{ts}.{t}"} for t in tools]})
-        mcp_bridge._observe_tool_call_reply(
-            "describe_toolset", {},
-            {"jsonrpc": "2.0", "id": 0, "result": {"content": [{"type": "text", "text": text}]}})
+        describe(ts, tools)
 
     # A real tool asked of the wrong toolset, in the other naming style.
     hinted = hint_for({"toolset_name": scene, "tool_name": "get_selected_actors"})
@@ -446,10 +450,23 @@ def test_tool_call_hints():
     hinted = hint_for({"toolset_name": scene, "tool_name": "get_actor"})
     check("near-miss tool name gets a did-you-mean",
           "Did you mean get_actors?" in hinted, hinted)
+    # The right toolset, the name in its other style: its exact spelling
+    # there, as a direct answer rather than a suggestion ahead of a list.
     app = "EditorToolset.EditorAppToolset"
     hinted = hint_for({"toolset_name": app, "tool_name": "get_camera_transform"})
-    check("so does the same tool in the other naming style",
-          "Did you mean GetCameraTransform?" in hinted, hinted)
+    check("the right toolset in the other naming style gets the exact name",
+          f"pass toolset_name '{app}' and tool_name 'GetCameraTransform'" in hinted
+          and "Did you mean" not in hinted, hinted)
+
+    # Regression for #19: a twin in that other style in another toolset must
+    # not win over the toolset that was called. get_foo on the toolset that
+    # has GetFoo used to be pointed at the one that has get_foo.
+    describe("Smoke.CamelTools", ["GetFoo"])
+    describe("Smoke.snake_tools", ["get_foo"])
+    hinted = hint_for({"toolset_name": "Smoke.CamelTools", "tool_name": "get_foo"})
+    check("a style-only miss in the right toolset stays in that toolset",
+          "pass toolset_name 'Smoke.CamelTools' and tool_name 'GetFoo'" in hinted
+          and "Smoke.snake_tools" not in hinted, hinted)
 
     # Never a different verb, however close the spelling: GetCameraTransform
     # is within the cutoff of this typo too, and so is save_actor of
