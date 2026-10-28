@@ -29,12 +29,13 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-def spawn(cache_path, grace="3"):
+def spawn(cache_path, grace="3", **extra_env):
     env = dict(
         os.environ,
         UNREAL_MCP_URL=DEAD_URL,
         UNREAL_MCP_CACHE=cache_path,
         UNREAL_MCP_GRACE=grace,
+        **extra_env,
     )
     return subprocess.Popen(
         [sys.executable, BRIDGE],
@@ -128,6 +129,53 @@ def test_serves_initialize_from_cache():
               bool(msg.get("result", {}).get("protocolVersion")), repr(msg)[:200])
     finally:
         proc.kill()
+
+
+def test_initialize_instructions():
+    """The initialize reply says what the server is, since the editor sends no instructions.
+
+    Through stdio from the cache (a live reply goes through the same
+    _with_instructions): the default sentence, or none with
+    UNREAL_MCP_INSTRUCTIONS empty. Then on _with_instructions itself:
+    instructions the editor sends are kept, and the reply it is given is
+    copied, not changed, since the live one is saved to the cache after.
+    """
+    print("\n[10] initialize carries instructions while the editor sends none")
+    sys.path.insert(0, ROOT)
+    import mcp_bridge
+
+    tmp = os.path.join(tempfile.mkdtemp(), "seeded.json")
+    write_cache(tmp)
+    init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                  "clientInfo": {"name": "smoke", "version": "0"}}})
+    for name, extra_env, want in (
+            ("the default sentence is added", {}, mcp_bridge.DEFAULT_INSTRUCTIONS),
+            ("none with UNREAL_MCP_INSTRUCTIONS empty", {"UNREAL_MCP_INSTRUCTIONS": ""}, None)):
+        proc = spawn(tmp, **extra_env)
+        out = []
+        reader(proc, out)
+        try:
+            proc.stdin.write(init + "\n")
+            proc.stdin.flush()
+            line = await_line(out, timeout=20)
+            result = (json.loads(line) if line else {}).get("result") or {}
+            check(name, result.get("protocolVersion") and result.get("instructions") == want,
+                  (line or "no reply")[:300])
+        finally:
+            proc.kill()
+
+    editor = {"protocolVersion": "2025-11-25", "capabilities": {}}
+    reply = {"jsonrpc": "2.0", "id": 1, "result": editor}
+    before = json.dumps(reply)
+    added = mcp_bridge._with_instructions(reply)
+    check("the reply given is left as it was",
+          added["result"].get("instructions") and json.dumps(reply) == before, before)
+    own = {"jsonrpc": "2.0", "id": 1, "result": dict(editor, instructions="The editor's own.")}
+    check("instructions the editor sends are kept",
+          mcp_bridge._with_instructions(own)["result"]["instructions"] == "The editor's own.")
+    error = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "x"}}
+    check("an error reply is left as it was", mcp_bridge._with_instructions(error) == error)
 
 
 def test_handshake_retry_false_is_a_single_attempt():
@@ -658,6 +706,7 @@ if __name__ == "__main__":
     test_tool_call_hints()
     test_resource_templates_answered_locally()
     test_auto_describe_on_failure()
+    test_initialize_instructions()
     print()
     if failures:
         print(f"FAILED ({len(failures)}): {', '.join(failures)}")
