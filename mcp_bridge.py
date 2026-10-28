@@ -959,6 +959,10 @@ COMPACT_DESCRIBE = os.environ.get("UNREAL_MCP_COMPACT_DESCRIBE") == "1"
 _RETURNS_SECTION_RE = re.compile(
     r"\n(?:[ \t]*\n)?[ \t]*Returns:[ \t]*\n.*?(?=\n[ \t]*\n|\Z)", re.S)
 
+# JSON Schema keywords whose value is data, not a schema: a "description" key
+# inside one (an object default, say) is part of that value and must survive.
+_SCHEMA_VALUE_KEYWORDS = frozenset(("default", "const", "enum", "examples"))
+
 
 def _compact_describe(data: dict) -> None:
     """Trim the descriptions of a parsed describe_toolset reply, in place.
@@ -985,8 +989,11 @@ def _compact_describe(data: dict) -> None:
                     del node["description"]
                 else:
                     seen.add(desc)
-            for value in node.values():
-                dedupe(value)
+            # A property named like one of these is skipped too: that only
+            # keeps its descriptions.
+            for key, value in node.items():
+                if key not in _SCHEMA_VALUE_KEYWORDS:
+                    dedupe(value)
         elif isinstance(node, list):
             for item in node:
                 dedupe(item)

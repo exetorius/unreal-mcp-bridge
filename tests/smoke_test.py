@@ -547,12 +547,20 @@ def test_compact_describe():
          "name": "Smoke.SceneTools.add_param",
          "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
          "outputSchema": {"type": "object", "properties": {"returnValue": {"type": "string"}}}},
+        # Values that hold a "description" key already seen above: data, not schema.
+        {"description": "Spawns an actor.",
+         "name": "Smoke.SceneTools.spawn_actor",
+         "inputSchema": {"type": "object", "properties": {
+             "options": {"type": "object", "default": {"description": "How to move it.", "n": 1},
+                         "examples": [{"description": "How to move it.", "n": 2}]},
+             "kind": {"type": "object", "enum": [{"description": ref["description"]}]},
+             "tag": {"type": "object", "const": {"description": ref["description"]}}}}},
     ]}
     reply = {"jsonrpc": "2.0", "id": 1,
              "result": {"content": [{"type": "text", "text": json.dumps(data)}]}}
     out = mcp_bridge._compact_describe_reply(json.loads(json.dumps(reply)))
     got = json.loads(out["result"]["content"][0]["text"])
-    save, move, add = got["tools"]
+    save, move, add, spawn = got["tools"]
     moved_actor = move["inputSchema"]["properties"]["actor"]
 
     check("a Returns: section is dropped when an outputSchema says the same",
@@ -574,11 +582,18 @@ def test_compact_describe():
           json.dumps(save["inputSchema"]["properties"]["actor"]))
     check("a description seen once is kept",
           move["inputSchema"]["properties"]["mode"].get("description") == "How to move it.")
+    check("a description key inside a default, examples, enum or const value is kept",
+          spawn["inputSchema"] == data["tools"][3]["inputSchema"], json.dumps(spawn["inputSchema"]))
 
     def without_descriptions(node):
-        """Everything but description strings: what a model builds arguments from."""
+        """Everything but schema description strings: what a model builds arguments from.
+
+        Values are compared whole, so a description key inside one counts.
+        """
+        values = ("default", "const", "enum", "examples")
         if isinstance(node, dict):
-            return {k: without_descriptions(v) for k, v in node.items()
+            return {k: v if k in values else without_descriptions(v)
+                    for k, v in node.items()
                     if not (k == "description" and isinstance(v, str))}
         if isinstance(node, list):
             return [without_descriptions(v) for v in node]
