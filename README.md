@@ -41,7 +41,10 @@ Claude's behalf:
 - after a reconnect, emits `notifications/tools/list_changed` downstream, so a
   recompiled or changed tool set is picked up automatically;
 - **caches the tool set to disk**, so even a cold start with the editor down
-  registers the real, non-empty tools (see below).
+  registers the real, non-empty tools (see below);
+- adds one sentence of `instructions` to the `initialize` result, which the
+  editor sends none of: what the server is and how its tools are reached, for
+  clients that put server instructions in context (Claude Code does).
 
 It's pure Python standard library — no `pip install`, no MCP SDK. It relays
 opaque JSON-RPC envelopes rather than modelling tools, so it keeps working
@@ -173,6 +176,7 @@ All optional, via environment variables (set them in the `env` block above):
 | `UNREAL_MCP_GRACE` | `45` | Seconds a forwarded call rides out refusals before reporting the editor as down. |
 | `UNREAL_MCP_HEADER_TIMEOUT` | `20` | Seconds to wait for response *headers* before calling the editor wedged. Capped at the call's own timeout. |
 | `UNREAL_MCP_DESCRIBE_TIMEOUT` | `5` | Socket timeout (s) for the `describe_toolset` the bridge sends itself when a `call_tool` fails against a toolset listed but never described, to have tool names to hint with. On timeout the hint is built from what is already known. |
+| `UNREAL_MCP_INSTRUCTIONS` | one sentence | `instructions` added to the `initialize` result while the editor sends none. The default sentence says the server is the running Unreal Editor, to use through `list_toolsets`, `describe_toolset` and `call_tool` rather than files or a shell. Set it to replace that sentence, or to an empty string for none. |
 
 ## Diagnostics
 

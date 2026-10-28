@@ -67,6 +67,9 @@ Config (env vars, all optional):
   UNREAL_MCP_CACHE         tool-cache path (default tool_cache.json beside script)
   UNREAL_MCP_DESCRIBE_TIMEOUT socket timeout for the bridge's own describe_toolset
                            on a failed call_tool, seconds (default 5)
+  UNREAL_MCP_INSTRUCTIONS  `instructions` for the initialize result while the
+                           editor sends none (default: one sentence saying what
+                           the server is; empty for none)
 """
 
 import difflib
@@ -98,6 +101,18 @@ HEADER_TIMEOUT = float(os.environ.get("UNREAL_MCP_HEADER_TIMEOUT", "20"))
 # _describe_unseen_toolset). Short on purpose: the client is waiting for the
 # failed call's reply meanwhile, and a hint is not worth a long wait.
 DESCRIBE_TIMEOUT = float(os.environ.get("UNREAL_MCP_DESCRIBE_TIMEOUT", "5"))
+
+# The editor's initialize result carries no `instructions`, its serverInfo name
+# is empty, and its three tools never say they reach an Unreal Editor: with no
+# rule of its own, a model asked about the project reads files or runs a shell
+# instead. Clients that put server instructions in context (Claude Code does)
+# get this sentence, only while the editor sends none. Empty: none at all.
+DEFAULT_INSTRUCTIONS = (
+    "This server is the running Unreal Editor: to inspect or change the open "
+    "project's levels, actors and assets, use its tools (list_toolsets, then "
+    "describe_toolset for exact tool names and arguments, then call_tool) rather "
+    "than reading files or running shell commands.")
+INSTRUCTIONS = os.environ.get("UNREAL_MCP_INSTRUCTIONS", DEFAULT_INSTRUCTIONS)
 
 _parsed = urlparse(UPSTREAM_URL)
 HOST = _parsed.hostname or "127.0.0.1"
@@ -531,8 +546,8 @@ def handle_initialize(msg: dict) -> None:
     cache = load_cache()
     if cache and cache.get("initializeResult"):
         state.protocol_version = cache.get("protocolVersion")
-        write_downstream({"jsonrpc": "2.0", "id": msg.get("id"),
-                          "result": cache["initializeResult"]})
+        write_downstream(_with_instructions({"jsonrpc": "2.0", "id": msg.get("id"),
+                                             "result": cache["initializeResult"]}))
         log(f"upstream down at startup ({live_err}); answered initialize from "
             f"cache; connecting in background")
         _ensure_background_connect()
@@ -554,13 +569,25 @@ def handle_initialize(msg: dict) -> None:
 def _emit_initialize(msg: dict, result: dict | None) -> None:
     """Send the initialize reply downstream (or an error if upstream gave none)."""
     if result is not None:
-        write_downstream(result)
+        write_downstream(_with_instructions(result))
     else:
         write_downstream({
             "jsonrpc": "2.0",
             "id": msg.get("id"),
             "error": {"code": -32603, "message": "upstream initialize returned no result"},
         })
+
+
+def _with_instructions(message: dict) -> dict:
+    """An initialize reply with INSTRUCTIONS added, if the editor sent none.
+
+    A copy: the cache keeps the editor's own result, so a cold start follows
+    the current UNREAL_MCP_INSTRUCTIONS (empty included), not a saved one.
+    """
+    result = message.get("result")
+    if INSTRUCTIONS and isinstance(result, dict) and not result.get("instructions"):
+        message = dict(message, result=dict(result, instructions=INSTRUCTIONS))
+    return message
 
 
 def _ensure_background_connect() -> None:
