@@ -1024,6 +1024,98 @@ def _observe_tool_call_reply(name: str, args: dict, message: dict) -> dict:
     return message
 
 
+# --------------------------------------------------------------------------- #
+# Compact describe_toolset (opt-in)                                            #
+# --------------------------------------------------------------------------- #
+#
+# describe_toolset replies are large: 315 KB for the 23 toolsets of a UE 5.8
+# editor, BlueprintTools alone 72 KB, about 15.6k tokens for a Qwen model. A
+# local model with a 32k context pays that for each toolset it describes. With
+# UNREAL_MCP_COMPACT_DESCRIBE=1 the bridge trims descriptions from the reply
+# before forwarding it, and nothing else: names, types, properties, required,
+# enums, defaults and titles stay exactly as the editor sent them, since those
+# are what a model needs to build valid arguments. Off by default.
+
+COMPACT_DESCRIBE = os.environ.get("UNREAL_MCP_COMPACT_DESCRIBE") == "1"
+
+# A tool description's "Returns:" section, from its header line (and the blank
+# line before it, if any: one tool's follows its Args: lines directly) to the
+# end of its paragraph.
+_RETURNS_SECTION_RE = re.compile(
+    r"\n(?:[ \t]*\n)?[ \t]*Returns:[ \t]*\n.*?(?=\n[ \t]*\n|\Z)", re.S)
+
+# JSON Schema keywords whose value is data, not a schema: a "description" key
+# inside one (an object default, say) is part of that value and must survive.
+_SCHEMA_VALUE_KEYWORDS = frozenset(("default", "const", "enum", "examples"))
+
+
+def _compact_describe(data: dict) -> None:
+    """Trim the descriptions of a parsed describe_toolset reply, in place.
+
+    The two cuts that measured worth it (Qwen tokens, all 23 toolsets):
+      * a tool description's "Returns:" section, when the tool has an
+        outputSchema to say the same (all 168 that have one do), -4%;
+      * a schema description identical to one earlier in the same reply,
+        -13%: every UObject reference repeats the same two sentences, 223 and
+        245 times across the editor's toolsets. The first one is kept.
+    outputSchema itself stays, although dropping it would save another 18%:
+    ProgrammaticToolset's execute_tool_script tells the model to read the
+    output schemas of the tools a script calls, to parse their results.
+    Dedenting the docstrings would save 1% of tokens: not worth it.
+    """
+    seen: set[str] = set()
+
+    def dedupe(node) -> None:
+        if isinstance(node, dict):
+            # A property named "description" is a dict, not a string: kept.
+            desc = node.get("description")
+            if isinstance(desc, str):
+                if desc in seen:
+                    del node["description"]
+                else:
+                    seen.add(desc)
+            # A property named like one of these is skipped too: that only
+            # keeps its descriptions.
+            for key, value in node.items():
+                if key not in _SCHEMA_VALUE_KEYWORDS:
+                    dedupe(value)
+        elif isinstance(node, list):
+            for item in node:
+                dedupe(item)
+
+    for tool in data.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if isinstance(tool.get("description"), str) and "outputSchema" in tool:
+            tool["description"] = _RETURNS_SECTION_RE.sub("", tool["description"])
+        for key in ("inputSchema", "outputSchema"):
+            dedupe(tool.get(key))
+
+
+def _compact_describe_reply(message: dict) -> dict:
+    """A describe_toolset reply with its descriptions trimmed (see above).
+
+    Anything unexpected in the reply leaves it exactly as the editor sent it:
+    this saves tokens, it must never be why a reply changes meaning or goes
+    missing.
+    """
+    try:
+        result = message.get("result")
+        if not isinstance(result, dict) or result.get("isError"):
+            return message
+        content = result.get("content")
+        if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+            return message
+        data = json.loads(content[0].get("text"))
+        if not isinstance(data, dict) or not isinstance(data.get("tools"), list):
+            return message
+        _compact_describe(data)
+        content[0]["text"] = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    except Exception:  # noqa: BLE001 - the reply goes out either way
+        log("compact describe failed; forwarding the reply as is:\n" + traceback.format_exc())
+    return message
+
+
 def forward(msg: dict, bounded: bool = True) -> None:
     """Forward a post-init request/notification upstream, recovering sessions.
 
@@ -1120,6 +1212,8 @@ def forward(msg: dict, bounded: bool = True) -> None:
             for message in resp.messages():
                 if tool_call_name and message.get("id") == target_id:
                     message = _observe_tool_call_reply(tool_call_name, tool_call_args, message)
+                    if COMPACT_DESCRIBE and tool_call_name == "describe_toolset":
+                        message = _compact_describe_reply(message)
                 write_downstream(message)
                 if is_request and message.get("id") == target_id:
                     break

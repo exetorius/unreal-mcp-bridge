@@ -169,6 +169,7 @@ All optional, via environment variables (set them in the `env` block above):
 | `UNREAL_MCP_TOOL_TIMEOUT` | `600` | Socket timeout (s) for `tools/call`. |
 | `UNREAL_MCP_QUICK_TIMEOUT` | `30` | Socket timeout (s) for handshake / list. |
 | `UNREAL_MCP_CACHE` | `tool_cache.json` beside the script | Cold-start tool-cache path. |
+| `UNREAL_MCP_COMPACT_DESCRIBE` | off | Set to `1` to trim descriptions from `describe_toolset` replies before they reach the client (a tool's `Returns:` section when its `outputSchema` says the same, and schema descriptions repeated earlier in the same reply), for models with a small context window. Names, types, enums, defaults and required fields are never changed. |
 | `UNREAL_MCP_GRACE` | `45` | Seconds a forwarded call rides out refusals before reporting the editor as down. |
 | `UNREAL_MCP_HEADER_TIMEOUT` | `20` | Seconds to wait for response *headers* before calling the editor wedged. Capped at the call's own timeout. |
 | `UNREAL_MCP_DESCRIBE_TIMEOUT` | `5` | Socket timeout (s) for the `describe_toolset` the bridge sends itself when a `call_tool` fails against a toolset listed but never described, to have tool names to hint with. On timeout the hint is built from what is already known. |
