@@ -29,12 +29,13 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-def spawn(cache_path, grace="3"):
+def spawn(cache_path, grace="3", **extra_env):
     env = dict(
         os.environ,
         UNREAL_MCP_URL=DEAD_URL,
         UNREAL_MCP_CACHE=cache_path,
         UNREAL_MCP_GRACE=grace,
+        **extra_env,
     )
     return subprocess.Popen(
         [sys.executable, BRIDGE],
@@ -128,6 +129,53 @@ def test_serves_initialize_from_cache():
               bool(msg.get("result", {}).get("protocolVersion")), repr(msg)[:200])
     finally:
         proc.kill()
+
+
+def test_initialize_instructions():
+    """The initialize reply says what the server is, since the editor sends no instructions.
+
+    Through stdio from the cache (a live reply goes through the same
+    _with_instructions): the default sentence, or none with
+    UNREAL_MCP_INSTRUCTIONS empty. Then on _with_instructions itself:
+    instructions the editor sends are kept, and the reply it is given is
+    copied, not changed, since the live one is saved to the cache after.
+    """
+    print("\n[10] initialize carries instructions while the editor sends none")
+    sys.path.insert(0, ROOT)
+    import mcp_bridge
+
+    tmp = os.path.join(tempfile.mkdtemp(), "seeded.json")
+    write_cache(tmp)
+    init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                  "clientInfo": {"name": "smoke", "version": "0"}}})
+    for name, extra_env, want in (
+            ("the default sentence is added", {}, mcp_bridge.DEFAULT_INSTRUCTIONS),
+            ("none with UNREAL_MCP_INSTRUCTIONS empty", {"UNREAL_MCP_INSTRUCTIONS": ""}, None)):
+        proc = spawn(tmp, **extra_env)
+        out = []
+        reader(proc, out)
+        try:
+            proc.stdin.write(init + "\n")
+            proc.stdin.flush()
+            line = await_line(out, timeout=20)
+            result = (json.loads(line) if line else {}).get("result") or {}
+            check(name, result.get("protocolVersion") and result.get("instructions") == want,
+                  (line or "no reply")[:300])
+        finally:
+            proc.kill()
+
+    editor = {"protocolVersion": "2025-11-25", "capabilities": {}}
+    reply = {"jsonrpc": "2.0", "id": 1, "result": editor}
+    before = json.dumps(reply)
+    added = mcp_bridge._with_instructions(reply)
+    check("the reply given is left as it was",
+          added["result"].get("instructions") and json.dumps(reply) == before, before)
+    own = {"jsonrpc": "2.0", "id": 1, "result": dict(editor, instructions="The editor's own.")}
+    check("instructions the editor sends are kept",
+          mcp_bridge._with_instructions(own)["result"]["instructions"] == "The editor's own.")
+    error = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "x"}}
+    check("an error reply is left as it was", mcp_bridge._with_instructions(error) == error)
 
 
 def test_handshake_retry_false_is_a_single_attempt():
@@ -648,6 +696,112 @@ def test_resource_templates_answered_locally():
         proc.kill()
 
 
+def test_compact_describe():
+    """UNREAL_MCP_COMPACT_DESCRIBE trims descriptions, never what builds args.
+
+    Unit test on the reply rewrite itself, with a describe_toolset reply
+    shaped like the editor's: docstring descriptions with Args:/Returns:
+    sections, and the UObject reference schema every object argument repeats.
+    """
+    print("\n[9] compact describe_toolset trims descriptions only")
+    sys.path.insert(0, ROOT)
+    import mcp_bridge
+
+    check("off unless UNREAL_MCP_COMPACT_DESCRIBE=1", mcp_bridge.COMPACT_DESCRIBE is False)
+
+    ref = {"type": "object", "title": "/Script/Engine.Actor",
+           "description": "Represents a reference to a UObject or UClass.",
+           "properties": {"refPath": {
+               "type": "string", "description": "The reference stored as a soft path string."}},
+           "required": ["refPath"]}
+    data = {"name": "Smoke.SceneTools", "version": "1.0", "description": "Scene tools.", "tools": [
+        {"description": "Saves the actor to disk.\n\n        Args:\n            actor: The actor "
+                        "to save.\n\n        Returns:\n            True if it was saved.",
+         "name": "Smoke.SceneTools.save_actor",
+         "inputSchema": {"type": "object", "properties": {"actor": ref}, "required": ["actor"]},
+         "outputSchema": {"type": "object", "properties": {"returnValue": {"type": "boolean"}}}},
+        {"description": "Moves an actor.\n\n        Args:\n            actor: The actor to move."
+                        "\n\n        Returns:\n            Where it ended up.",
+         "name": "Smoke.SceneTools.move_actor",
+         "inputSchema": {"type": "object", "properties": {
+             "actor": ref,
+             "mode": {"type": "string", "title": "EMoveMode", "enum": ["Snap", "Free"],
+                      "default": "Snap", "description": "How to move it."},
+             "description": {"type": "string"}},
+             "required": ["actor", "mode"]}},
+        # As BlueprintTools' add_object_function_param has it: no blank line
+        # between the Args: lines and Returns:.
+        {"description": "Adds a param.\n\n        Args:\n            name: Its name.\n"
+                        "        Returns:\n            The new pin.",
+         "name": "Smoke.SceneTools.add_param",
+         "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
+         "outputSchema": {"type": "object", "properties": {"returnValue": {"type": "string"}}}},
+        # Values that hold a "description" key already seen above: data, not schema.
+        {"description": "Spawns an actor.",
+         "name": "Smoke.SceneTools.spawn_actor",
+         "inputSchema": {"type": "object", "properties": {
+             "options": {"type": "object", "default": {"description": "How to move it.", "n": 1},
+                         "examples": [{"description": "How to move it.", "n": 2}]},
+             "kind": {"type": "object", "enum": [{"description": ref["description"]}]},
+             "tag": {"type": "object", "const": {"description": ref["description"]}}}}},
+    ]}
+    reply = {"jsonrpc": "2.0", "id": 1,
+             "result": {"content": [{"type": "text", "text": json.dumps(data)}]}}
+    out = mcp_bridge._compact_describe_reply(json.loads(json.dumps(reply)))
+    got = json.loads(out["result"]["content"][0]["text"])
+    save, move, add, spawn = got["tools"]
+    moved_actor = move["inputSchema"]["properties"]["actor"]
+
+    check("a Returns: section is dropped when an outputSchema says the same",
+          "Returns:" not in save["description"]
+          and "True if it was saved" not in save["description"], save["description"])
+    check("the summary and Args: section are kept as they were",
+          save["description"] == data["tools"][0]["description"].split("\n\n        Returns:")[0],
+          save["description"])
+    check("so is one right after the Args: lines",
+          add["description"] == "Adds a param.\n\n        Args:\n            name: Its name.",
+          add["description"])
+    check("a tool with no outputSchema keeps its Returns: section",
+          move["description"] == data["tools"][1]["description"], move["description"])
+    check("a schema description already seen in the reply is dropped",
+          "description" not in moved_actor
+          and "description" not in moved_actor["properties"]["refPath"], json.dumps(moved_actor))
+    check("its first occurrence is kept",
+          save["inputSchema"]["properties"]["actor"]["description"] == ref["description"],
+          json.dumps(save["inputSchema"]["properties"]["actor"]))
+    check("a description seen once is kept",
+          move["inputSchema"]["properties"]["mode"].get("description") == "How to move it.")
+    check("a description key inside a default, examples, enum or const value is kept",
+          spawn["inputSchema"] == data["tools"][3]["inputSchema"], json.dumps(spawn["inputSchema"]))
+
+    def without_descriptions(node):
+        """Everything but schema description strings: what a model builds arguments from.
+
+        Values are compared whole, so a description key inside one counts.
+        """
+        values = ("default", "const", "enum", "examples")
+        if isinstance(node, dict):
+            return {k: v if k in values else without_descriptions(v)
+                    for k, v in node.items()
+                    if not (k == "description" and isinstance(v, str))}
+        if isinstance(node, list):
+            return [without_descriptions(v) for v in node]
+        return node
+
+    check("names, types, properties, required, enums, defaults and titles are untouched "
+          "(a property named description included)",
+          without_descriptions(got) == without_descriptions(data))
+
+    error_reply = {"jsonrpc": "2.0", "id": 2, "result": {"isError": True, "content": [
+        {"type": "text", "text": "Toolset 'Smoke.Nope' not found"}]}}
+    text_reply = {"jsonrpc": "2.0", "id": 3, "result": {"content": [
+        {"type": "text", "text": "not JSON at all"}]}}
+    for name, msg in (("an error reply", error_reply), ("a non-JSON reply", text_reply)):
+        before = json.dumps(msg)
+        check(f"{name} is forwarded as it was",
+              json.dumps(mcp_bridge._compact_describe_reply(msg)) == before)
+
+
 if __name__ == "__main__":
     print(f"smoke: {BRIDGE}\nsmoke: upstream {DEAD_URL} (intentionally closed)")
     test_survives_absent_editor()
@@ -656,8 +810,10 @@ if __name__ == "__main__":
     test_survives_non_object_json_lines()
     test_handshake_retry_false_is_a_single_attempt()
     test_tool_call_hints()
+    test_compact_describe()
     test_resource_templates_answered_locally()
     test_auto_describe_on_failure()
+    test_initialize_instructions()
     print()
     if failures:
         print(f"FAILED ({len(failures)}): {', '.join(failures)}")
